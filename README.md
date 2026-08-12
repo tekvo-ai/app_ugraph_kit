@@ -119,7 +119,9 @@ Operational events are appended to `runs.jsonl` and exposed through
 
 ## Source
 
-Canonical repo (Tekvo open source): https://github.com/tekvo-ai/app_ugraph_kit  
+Canonical repo (Tekvo open source): https://github.com/tekvo-ai/app_ugraph_kit
+
+This is the Tekvo AI open-source home for ugraph.  
 Site: https://ugraph.build
 
 ## Development
