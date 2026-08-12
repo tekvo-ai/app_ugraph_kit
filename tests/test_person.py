@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
-from tests.test_roundtrip import scaffold
 from ugraph import person as person_mod
 from ugraph.cli import build_parser
 from ugraph.store import read_md
+
 
 URL = "https://www.youtube.com/watch?v=kPN564Kol14&t=3768s"
 
@@ -34,8 +35,9 @@ def test_resolve_youtube_preserves_supplied_timestamp(monkeypatch):
         "channel": "Kun Chen",
         "channel_url": "https://www.youtube.com/@kunchenguid",
         "uploader_id": "@kunchenguid",
+        "webpage_url": "https://www.youtube.com/watch?v=kPN564Kol14",
     }
-    monkeypatch.setattr(person_mod.shutil, "which", lambda _name: "/bin/yt-dlp")
+    monkeypatch.setattr(person_mod, "_require_yt_dlp", lambda: None)
     monkeypatch.setattr(
         person_mod.subprocess,
         "run",
@@ -51,8 +53,7 @@ def test_resolve_youtube_preserves_supplied_timestamp(monkeypatch):
     assert person.source_url == URL
 
 
-def test_add_person_writes_canonical_and_redirect(tmp_path):
-    cfg = scaffold(tmp_path)
+def test_add_person_writes_canonical_and_redirect(cfg):
     result = person_mod.add(cfg, kun())
 
     assert result.created
@@ -60,6 +61,7 @@ def test_add_person_writes_canonical_and_redirect(tmp_path):
     assert result.redirect_path == cfg.kb / "resources/people/kun-chen.md"
     canonical_meta, canonical_body = read_md(result.canonical_path)
     redirect_meta, redirect_body = read_md(result.redirect_path)
+    assert canonical_meta["type"] == "entity"
     assert canonical_meta["subtype"] == "person"
     assert canonical_meta["handles"] == ["@kunchenguid"]
     assert canonical_meta["discovered_from"] == [URL]
@@ -68,8 +70,7 @@ def test_add_person_writes_canonical_and_redirect(tmp_path):
     assert "../../entities/people/kun-chen.md" in redirect_body
 
 
-def test_add_person_is_idempotent_and_preserves_canonical(tmp_path):
-    cfg = scaffold(tmp_path)
+def test_add_person_is_idempotent_and_preserves_canonical(cfg):
     first = person_mod.add(cfg, kun())
     first.canonical_path.write_text(
         first.canonical_path.read_text() + "\nHuman-authored note.\n",

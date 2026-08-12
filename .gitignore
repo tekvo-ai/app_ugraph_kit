@@ -1,19 +1,26 @@
+.DS_Store
+.venv/
+.smoke/
+.pytest_cache/
 __pycache__/
 *.py[cod]
-.venv*/
-venv/
-dist/
+
 build/
+dist/
 *.egg-info/
-.pytest_cache/
-.ruff_cache/
-.DS_Store
 
-# working state — a KB's own .ugraph/ dir holds candidates, state and logs
-.ugraph/
-kb-graph.html
-*.canvas
-ugraph.toml
+.coverage
+htmlcov/
 
-# `ugraph skills install` writes here; the source of truth is skills/
-.claude/
+.env
+.env.*
+!.env.example
+
+# Nested site repo (saran-io/ugraph-web) + local-only
+ugraph-web/
+.agents/
+.vscode/
+papers/
+export,
+opencode.json
+skills-lock.json

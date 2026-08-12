@@ -1,0 +1,13 @@
+{
+  "version": 0,
+  "locked_for_eval": false,
+  "entries": [
+    {
+      "slug": "example-capture",
+      "source_type": "copy-paste",
+      "uri": "stdin",
+      "added": "2026-08-06",
+      "why": "First M0 smoke document; replace with your real notes."
+    }
+  ]
+}

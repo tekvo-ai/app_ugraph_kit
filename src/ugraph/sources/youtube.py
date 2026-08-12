@@ -79,17 +79,77 @@ def _log(config: Config, message: str, echo: bool = False) -> None:
 # ---------------------------------------------------------------------------
 
 
+def is_feed_url(value: str) -> bool:
+    """True for playlist / uploads feeds ugraph should ingest (not person-resolve)."""
+    from urllib.parse import parse_qs, urlparse
+
+    value = value.strip()
+    if not value or any(ch.isspace() for ch in value):
+        return False
+    try:
+        parsed = urlparse(value)
+    except ValueError:
+        return False
+    host = parsed.netloc.lower()
+    if host not in {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"}:
+        return False
+    path = parsed.path.rstrip("/")
+    query = parse_qs(parsed.query)
+    if "list" in query or path.endswith("/playlist"):
+        return True
+    if path.endswith(("/videos", "/streams", "/releases")):
+        return True
+    return False
+
+
+def channel_state_key(channel_url: str) -> str:
+    """Canonical state key for a channel/playlist URL.
+
+    `watch?v=…&list=…` and `playlist?list=…` must share one record, otherwise the
+    same playlist splits into two slugs and resume looks empty.
+    """
+    from urllib.parse import parse_qs, urlparse
+
+    url = channel_url.strip().rstrip("/")
+    parsed = urlparse(url)
+    query = parse_qs(parsed.query)
+    list_ids = query.get("list") or []
+    if list_ids:
+        return f"https://www.youtube.com/playlist?list={list_ids[0]}"
+    return url
+
+
+def _listing_url(channel_url: str) -> str:
+    """Normalize a channel/playlist URL for yt-dlp flat listing.
+
+    Channel roots need `/videos` appended. Playlist URLs must stay intact —
+    appending `/videos` produces a 404/400 and breaks the whole ingest.
+    """
+    from urllib.parse import parse_qs, urlparse
+
+    url = channel_state_key(channel_url) if "list=" in channel_url else channel_url.strip().rstrip("/")
+    parsed = urlparse(url)
+    path = parsed.path.rstrip("/")
+    query = parse_qs(parsed.query)
+    if "list" in query or path.endswith("/playlist"):
+        return url
+    if path.endswith(("/videos", "/streams", "/releases")):
+        return url
+    # Single-video URLs list themselves; don't rewrite to /videos.
+    if "youtu.be" in parsed.netloc.lower() or path.startswith("/watch"):
+        return url
+    return url + "/videos"
+
+
 def list_channel_videos(channel_url: str, limit: int | None = None) -> list[dict]:
-    """Return [{id, title, duration}] for a channel, newest first.
+    """Return [{id, title, duration}] for a channel or playlist, newest first.
 
     Pure read: touches no config and writes nothing, so a CLI can call it to preview
     a channel before deciding to ingest.
     """
     _require_yt_dlp()
 
-    url = channel_url.rstrip("/")
-    if not url.endswith(("/videos", "/streams")):
-        url += "/videos"
+    url = _listing_url(channel_url)
 
     cmd = [YT_DLP, "--flat-playlist", "--ignore-errors",
            "--print", "%(id)s\t%(title)s\t%(duration)s"]
@@ -343,7 +403,7 @@ def iso_from_upload(upload_date: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def ids_on_disk(config: Config) -> set[str]:
+def ids_on_disk(config: Config, slug: str | None = None) -> set[str]:
     """Every `youtube_id` recorded in a transcript under `raw/`.
 
     The state file is a cache of this, not the authority. It was treated as the
@@ -351,11 +411,17 @@ def ids_on_disk(config: Config) -> set[str]:
     offered to re-download 151 videos it already had — none of the evidence on disk
     was consulted.
 
+    When `slug` is set, only that channel folder is scanned. `--repair-state` needs
+    that scope: a polluted playlist record may list IDs that exist under a different
+    channel and must not count as held for this feed.
+
     Reading frontmatter for a few hundred files costs milliseconds; a wrong answer
     costs a full re-ingest.
     """
     found: set[str] = set()
     raw_dir = Path(config.raw_dir)
+    if slug:
+        raw_dir = raw_dir / slug
     if not raw_dir.is_dir():
         return found
     for path in raw_dir.rglob("*.md"):
@@ -373,7 +439,8 @@ def ids_on_disk(config: Config) -> set[str]:
     return found
 
 
-def reconcile(config: Config, recorded: Iterable[str]) -> set[str]:
+def reconcile(config: Config, recorded: Iterable[str],
+              slug: str | None = None) -> set[str]:
     """Union of what state remembers and what is actually on disk.
 
     Union rather than replace, in both directions:
@@ -382,8 +449,75 @@ def reconcile(config: Config, recorded: Iterable[str]) -> set[str]:
     - state-only IDs are kept because a transcript may have been deliberately
       removed. This KB has exactly one — a talk ingested twice under two titles,
       where deleting the duplicate must not invite it back on the next run.
+
+    Scope disk recovery to `slug` when known so one feed cannot absorb another
+    channel's youtube_ids into its ingested list (multi-channel KB pollution).
     """
-    return set(recorded) | ids_on_disk(config)
+    return set(recorded) | ids_on_disk(config, slug=slug)
+
+
+def repair_state(config: Config, channel_url: str,
+                 slug: str | None = None) -> dict:
+    """Drop `ingested` IDs that have no raw transcript under this feed's slug.
+
+    Default resume keeps state-only IDs (deliberate deletes). When files were
+    lost or pruned — or when a playlist record was polluted with another
+    channel's IDs — `--repair-state` trusts the slug folder on disk again.
+    """
+    state = State(config.state, JOB)
+    channels: dict = state.setdefault("channels", {})
+    key = channel_state_key(channel_url)
+
+    # Merge any alias keys (watch?v=&list=) into the canonical playlist key.
+    aliases = [
+        k for k in list(channels)
+        if k != key and channel_state_key(k) == key
+    ]
+    record: dict = dict(channels.get(key, {}))
+    merged_ingested: set[str] = set(record.get("ingested", []))
+    merged_failed: dict = dict(record.get("failed", {}))
+    for alias in aliases:
+        other = channels.pop(alias, {}) or {}
+        merged_ingested.update(other.get("ingested", []))
+        for vid, info in (other.get("failed") or {}).items():
+            merged_failed.setdefault(vid, info)
+        if not record.get("slug") and other.get("slug"):
+            record["slug"] = other["slug"]
+
+    slug_for = slug or record.get("slug")
+    if not slug_for:
+        raise RuntimeError(
+            "repair-state needs a channel slug (pass --slug, or repair a feed "
+            "that was ingested at least once)"
+        )
+
+    disk = ids_on_disk(config, slug=slug_for)
+    before = len(merged_ingested)
+    kept = sorted(vid for vid in merged_ingested if vid in disk)
+    removed = before - len(kept)
+
+    channels[key] = {
+        "slug": slug_for,
+        "ingested": kept,
+        "failed": merged_failed,
+        "last_run": record.get("last_run") or state.get("last_run"),
+        "total_listed": record.get("total_listed"),
+        "repaired_at": iso(),
+    }
+    state.set("channels", channels)
+    state.checkpoint()
+    _log(config, f"repair-state {key}: kept {len(kept)}, dropped {removed}, "
+         f"slug={slug_for}, merged_aliases={len(aliases)}")
+
+    return {
+        "channel": key,
+        "slug": slug_for,
+        "before": before,
+        "kept": len(kept),
+        "removed": removed,
+        "merged_aliases": aliases,
+        "on_disk": len(disk),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -437,11 +571,36 @@ def ingest(config: Config,
         listing = list_channel_videos(channel_url,
                                       limit=None if force else max(limit * 5, 50))
 
-    key = channel_url.rstrip("/")
+    key = channel_state_key(channel_url)
+    # Fold alias keys once so resume always hits the canonical record.
+    for alias in [k for k in list(channels)
+                  if k != key and channel_state_key(k) == key]:
+        other = channels.pop(alias, {}) or {}
+        base = channels.setdefault(key, {})
+        base.setdefault("ingested", [])
+        base["ingested"] = sorted(set(base.get("ingested", [])) |
+                                  set(other.get("ingested", [])))
+        failed_merge = dict(base.get("failed", {}))
+        for vid, info in (other.get("failed") or {}).items():
+            failed_merge.setdefault(vid, info)
+        base["failed"] = failed_merge
+        if not base.get("slug") and other.get("slug"):
+            base["slug"] = other["slug"]
+        channels[key] = base
+        state.set("channels", channels)
+        state.checkpoint()
+
     record: dict = dict(channels.get(key, {}))
 
+    # Reuse the slug this channel was previously ingested under, so a resumed run
+    # cannot land the same channel in two different directories. Needed before
+    # reconcile so disk recovery stays inside this feed's folder.
+    slug_for_channel = slug or record.get("slug")
+
     # State is a cache of what is on disk, never the authority — see reconcile().
-    seen: set[str] = reconcile(config, record.get("ingested", []))
+    seen: set[str] = reconcile(
+        config, record.get("ingested", []), slug=slug_for_channel,
+    )
     recovered = len(seen) - len(set(record.get("ingested", [])))
 
     # Videos that can never succeed (no captions at all) are remembered so they stop
@@ -459,10 +618,6 @@ def ingest(config: Config,
     pending = [v for v in listing
                if force or (v["id"] not in seen and v["id"] not in excluded)]
     batch = pending[:limit]
-
-    # Reuse the slug this channel was previously ingested under, so a resumed run
-    # cannot land the same channel in two different directories.
-    slug_for_channel = slug or record.get("slug")
 
     result = {
         "channel": key,

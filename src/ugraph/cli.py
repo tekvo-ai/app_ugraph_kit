@@ -16,6 +16,7 @@ import json
 import os
 import shutil
 import sys
+import time
 from pathlib import Path
 
 from ugraph import __version__
@@ -42,104 +43,6 @@ def _bundled(name: str) -> Path:
     if repo.is_dir():
         return repo
     sys.exit(f"ugraph: cannot locate bundled {name}/ — is the install complete?")
-
-
-def _clipboard_text() -> str:
-    """Read a desktop clipboard when a supported command is available."""
-    import subprocess
-
-    commands = [
-        ["pbpaste"],
-        ["wl-paste", "--no-newline"],
-        ["xclip", "-selection", "clipboard", "-o"],
-        ["xsel", "--clipboard", "--output"],
-        ["powershell.exe", "-NoProfile", "-Command", "Get-Clipboard"],
-    ]
-    for command in commands:
-        if shutil.which(command[0]) is None:
-            continue
-        try:
-            result = subprocess.run(command, capture_output=True, text=True, timeout=5)
-        except (OSError, subprocess.SubprocessError):
-            continue
-        if result.returncode == 0:
-            return result.stdout
-    return ""
-
-
-def _add_person_flow(cfg, url: str, *, yes: bool = False,
-                     name: str | None = None) -> int:
-    """Resolve, preview, confirm, and write one person reference."""
-    from dataclasses import replace
-
-    from ugraph import person as person_mod
-
-    try:
-        person = person_mod.resolve(url)
-    except person_mod.PersonResolutionError as exc:
-        sys.exit(f"ugraph: {exc}")
-    if name:
-        person = replace(person, name=name.strip())
-
-    print(f"Detected: {person.name}{f' ({person.handle})' if person.handle else ''}")
-    print(f"  profile: {person.profile_url}")
-    print(f"  source:  {person.source_title}")
-
-    if not yes:
-        if not sys.stdin.isatty():
-            print("\nNothing written: confirmation needs a terminal.")
-            print(f"Run: ugraph person {url!r} --yes")
-            return 1
-        answer = input("Add this person to your knowledge base? [Y/n] ").strip().lower()
-        if answer not in ("", "y", "yes"):
-            print("Nothing written.")
-            return 0
-
-    result = person_mod.add(cfg, person)
-    action = "Created" if result.created else "Already exists"
-    print(f"{action}:")
-    print(f"  canonical → {result.canonical_path}")
-    print(f"  redirect  → {result.redirect_path}")
-    return 0
-
-
-def _person_url(url: str | None = None) -> str:
-    if url:
-        return url.strip()
-    clipboard = _clipboard_text().strip()
-    if clipboard:
-        print("(using clipboard)")
-        return clipboard
-    if not sys.stdin.isatty():
-        return sys.stdin.read().strip()
-    return input("Paste a YouTube link: ").strip()
-
-
-def cmd_person(args) -> int:
-    url = _person_url(getattr(args, "url", None))
-    if not url:
-        sys.exit("ugraph: no URL supplied")
-    return _add_person_flow(
-        _config(args),
-        url,
-        yes=getattr(args, "yes", False),
-        name=getattr(args, "name", None),
-    )
-
-
-def cmd_smart(args) -> int:
-    """Bare `ugraph`: route one pasted/copied URL to the smallest useful action."""
-    from ugraph import person as person_mod
-
-    url = _person_url()
-    if not url:
-        sys.exit("ugraph: no input supplied")
-    if person_mod.is_supported_url(url):
-        return _add_person_flow(_config(args), url)
-    sys.exit(
-        "ugraph: bare capture currently supports YouTube URLs\n"
-        "  Try `ugraph --help` for explicit commands."
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -306,10 +209,32 @@ def _ingest_from_init(cfg, answers: dict) -> None:
 
 def cmd_ingest(args) -> int:
     cfg = _config(args)
+    if args.source == "file":
+        from ugraph import ingest as ingest_mod
+
+        result = ingest_mod.ingest_path(cfg, args.url)
+        print(f"Ingested {result.slug}: {result.written} new, "
+              f"{result.skipped} skipped, {result.removed} removed "
+              f"({result.total_chunks} chunk(s) total)")
+        return 0
+
     if args.source != "youtube":
         sys.exit(f"ugraph: unknown source '{args.source}' (only 'youtube' so far)")
 
     from ugraph.sources import youtube
+
+    if getattr(args, "repair_state", False):
+        repaired = youtube.repair_state(cfg, args.url, slug=args.slug)
+        print(f"Repaired state for {repaired['channel']}")
+        if repaired.get("slug"):
+            print(f"  slug: {repaired['slug']}")
+        print(f"  ingested before: {repaired['before']}")
+        print(f"  kept (on disk):  {repaired['kept']}")
+        print(f"  dropped:         {repaired['removed']}")
+        if repaired.get("merged_aliases"):
+            print(f"  merged alias keys: {len(repaired['merged_aliases'])}")
+        print("  Re-run ingest (without --repair-state) to fetch missing videos.")
+        return 0
 
     def progress(i, total, vid, title):
         print(f"[{i}/{total}] {vid}  {title[:58]}")
@@ -357,7 +282,516 @@ def cmd_ingest(args) -> int:
     if result.get("failed"):
         print(f"  {result['failed']} video(s) recorded as unfetchable (no captions); "
               "they will not be retried. --retry-failed reconsiders them.")
-    print("Next: ugraph index && ugraph lint")
+
+    # The product promise for a feed URL is end-to-end: raw → candidates → draft
+    # concepts → indexes. Capture already auto-synthesizes; YouTube must too, or
+    # "ugraph the playlist" stops at transcripts and looks broken. Re-running ingest
+    # with nothing new still synthesizes any pending sources for this channel.
+    channel_slug = result.get("slug")
+    _run_feed_pipeline(
+        cfg,
+        limit=args.limit,
+        channel=channel_slug,
+        skip_extract=getattr(args, "no_synthesize", False),
+    )
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# capture (M0 copy-paste)
+# ---------------------------------------------------------------------------
+
+def _clipboard_text() -> str:
+    import subprocess
+
+    # Clipboard support is opportunistic. A headless Linux install should fall
+    # back to paste + Ctrl+D, not crash because the macOS-only `pbpaste` binary
+    # is absent.
+    commands = [
+        ["pbpaste"],
+        ["wl-paste", "--no-newline"],
+        ["xclip", "-selection", "clipboard", "-o"],
+        ["xsel", "--clipboard", "--output"],
+        ["powershell.exe", "-NoProfile", "-Command", "Get-Clipboard"],
+    ]
+    for command in commands:
+        if shutil.which(command[0]) is None:
+            continue
+        try:
+            result = subprocess.run(
+                command, capture_output=True, text=True, timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if result.returncode == 0:
+            return result.stdout
+    return ""
+
+
+def _add_person_flow(cfg, url: str, *, yes: bool = False,
+                     name: str | None = None) -> int:
+    """Resolve, preview, confirm, and write one person reference."""
+    from dataclasses import replace
+    from ugraph import person as person_mod
+
+    try:
+        person = person_mod.resolve(url)
+    except (RuntimeError, person_mod.PersonResolutionError) as exc:
+        sys.exit(f"ugraph: {exc}")
+    if name:
+        person = replace(person, name=name.strip())
+
+    print(f"Detected: {person.name}"
+          f"{f' ({person.handle})' if person.handle else ''}")
+    print(f"  profile: {person.profile_url}")
+    print(f"  source:  {person.source_title}")
+
+    if not yes:
+        if not sys.stdin.isatty():
+            print("\nNothing written: confirmation needs a terminal.")
+            print(f"Run: ugraph person {url!r} --yes")
+            return 1
+        answer = input("Add this person to your knowledge base? [Y/n] ").strip().lower()
+        if answer not in ("", "y", "yes"):
+            print("Nothing written.")
+            return 0
+
+    result = person_mod.add(cfg, person)
+    action = "Created" if result.created else "Already exists"
+    print(f"{action}:")
+    print(f"  canonical → {result.canonical_path}")
+    print(f"  redirect  → {result.redirect_path}")
+    return 0
+
+
+def cmd_person(args) -> int:
+    cfg = _config(args)
+    url = getattr(args, "url", None)
+    if not url:
+        url = _clipboard_text().strip()
+        if not url:
+            if not sys.stdin.isatty():
+                sys.exit("ugraph: no URL supplied")
+            url = input("Paste a YouTube link: ").strip()
+    return _add_person_flow(
+        cfg, url, yes=getattr(args, "yes", False),
+        name=getattr(args, "name", None),
+    )
+
+
+def cmd_embed(args) -> int:
+    """Local Mac embeddings + paper §3.2 hash reuse (see `ugraph embed --bench`)."""
+    from ugraph import embed as embed_mod
+
+    cfg = _config(args)
+    try:
+        encoder = embed_mod.resolve_encoder(
+            model=args.model,
+            host=args.host,
+            fake=args.fake,
+            fake_delay_ms=args.fake_delay_ms,
+        )
+    except embed_mod.EmbedError as exc:
+        sys.exit(f"ugraph: {exc}")
+
+    if args.bench:
+        print("ugraph embed --bench  (omni-macos §3.2 reuse across edits)")
+        print("  indexing a synthetic doc, then re-indexing after append / mid-file insert")
+        print("  reuse OFF = re-encode every chunk; reuse ON = skip matching hashes")
+        print()
+        try:
+            report = embed_mod.run_reuse_bench(
+                cfg, encoder=encoder, chunks=args.chunks
+            )
+        except embed_mod.EmbedError as exc:
+            sys.exit(f"ugraph: {exc}")
+        print(report.as_table())
+        print()
+        print("Vectors are derived state under <kb>/.ugraph/vectors/ — wipe anytime.")
+        return 0
+
+    slugs = [args.slug] if args.slug else None
+    try:
+        results = embed_mod.embed_all(
+            cfg, encoder=encoder, reuse=not args.no_reuse, slugs=slugs
+        )
+    except embed_mod.EmbedError as exc:
+        sys.exit(f"ugraph: {exc}")
+
+    for r in results:
+        mode = "reuse" if r.reuse else "no-reuse"
+        print(
+            f"{r.slug}: {r.encoded} encoded, {r.reused} reused, "
+            f"{r.removed} removed  ({r.total} chunks, {r.seconds:.2f}s, {mode}, "
+            f"{r.model} {r.dim}d)"
+        )
+    return 0
+
+
+def _confirm_ingest(prompt: str, *, yes: bool) -> bool:
+    """Ask before writing. TTY defaults to yes on empty Enter; non-TTY needs --yes."""
+    if yes:
+        return True
+    if not sys.stdin.isatty():
+        print("Nothing written: confirmation needs a terminal (or pass --yes).")
+        return False
+    answer = input(f"{prompt} ").strip().lower()
+    if answer not in ("", "y", "yes"):
+        print("Nothing written.")
+        return False
+    return True
+
+
+def cmd_capture(args) -> int:
+    cfg = _config(args)
+    from ugraph import capture_intent
+    from ugraph import ingest as ingest_mod
+
+    clipboard = getattr(args, "clipboard", False)
+    source_note = ""
+    if not clipboard and sys.stdin.isatty():
+        # Bare `ugraph` / `ugraph capture` at a terminal: the daily flow is
+        # copy → preview → confirm → act.
+        clip = _clipboard_text()
+        if clip.strip():
+            source_note = "(from clipboard)"
+            text = clip
+        else:
+            print("Paste content, then Ctrl+D:", file=sys.stderr)
+            text = sys.stdin.read()
+            source_note = "(from paste)"
+    elif clipboard:
+        try:
+            text = _clipboard_text()
+        except Exception as exc:  # pragma: no cover
+            sys.exit(f"ugraph: clipboard read failed: {exc}")
+        source_note = "(from clipboard)"
+    else:
+        text = sys.stdin.read()
+        source_note = "(from stdin)"
+
+    if not text.strip():
+        sys.exit("ugraph: nothing to capture (no input text)")
+
+    intent = capture_intent.classify(text)
+    print(capture_intent.format_preview(intent))
+    if source_note:
+        print(f"  {source_note}")
+
+    # Piped stdin (scripts/CI): act without a prompt. Interactive TTY: confirm.
+    # Explicit --yes always skips the prompt.
+    auto = getattr(args, "yes", False) or (
+        not sys.stdin.isatty() and not clipboard
+        and source_note == "(from stdin)"
+    )
+    if not auto:
+        if not _confirm_ingest(intent.confirm_prompt, yes=False):
+            return 0 if sys.stdin.isatty() else 1
+
+    if intent.kind in {"youtube_playlist", "youtube_feed"}:
+        print(f"({intent.label} — running ingest → synthesize → concepts)")
+        ns = argparse.Namespace(
+            kb=getattr(args, "kb", None),
+            source="youtube",
+            url=intent.text,
+            limit=getattr(args, "limit", None) or 10,
+            newest=None,
+            slug=None,
+            dry_run=False,
+            sleep=1.5,
+            force=False,
+            retry_failed=False,
+            repair_state=False,
+            synthesize=True,
+            no_synthesize=False,
+        )
+        return cmd_ingest(ns)
+
+    if intent.kind == "youtube_person":
+        # Already confirmed at capture level — skip the second person prompt.
+        return _add_person_flow(cfg, intent.text, yes=True)
+
+    title = getattr(args, "title", None)
+    slug = getattr(args, "slug", None)
+    if slug is None:
+        title = title or ingest_mod.derive_title(intent.text)
+        slug = ingest_mod.unique_slug(cfg, title)
+
+    source_uri = (
+        "clipboard" if "clipboard" in source_note
+        else "stdin" if "stdin" in source_note or "paste" in source_note
+        else "stdin"
+    )
+    result = ingest_mod.capture_text(
+        cfg, intent.text, title=title or slug, slug=slug, source_uri=source_uri,
+        source_type="copy-paste",
+    )
+    print(f"Captured {result.slug}: {result.written} new, {result.skipped} skipped "
+          f"({result.total_chunks} chunk(s))")
+    print(f"  → {result.raw_path}")
+
+    _maybe_synthesize(cfg, result.slug)
+    return 0
+
+
+def _maybe_synthesize(cfg, slug: str) -> None:
+    """Auto Phase A after capture when a backend is configured.
+
+    Synthesis is opt-in infrastructure, not a surprise: with no backend configured we
+    say so once and stop. With one, every quote is gated against the chunks before
+    anything is written, so a weak model costs retries, not trust.
+    """
+    from ugraph import extract as extract_mod
+    from ugraph import promote as promote_mod
+
+    backend = extract_mod.resolve_backend(cfg)
+    if backend is None:
+        print("  (synthesis skipped — no model configured; run `ugraph auth status`)")
+        return
+
+    model = getattr(backend, "model", "")
+    print(f"  synthesizing with {backend.name} ({model})…")
+    res = extract_mod.extract_document(cfg, slug, backend)
+    if not res.written:
+        print(f"  synthesis failed: {res.error}")
+        if "401" in res.error or "AuthenticationError" in res.error:
+            print(f"  → the {getattr(backend, 'provider', '')} key was rejected. "
+                  "Fix it with `ugraph auth set <provider>`, or switch with "
+                  "`ugraph auth use openai` / `ugraph auth use ollama`")
+        elif "credit" in res.error.lower() or "insufficient_quota" in res.error:
+            print(f"  → key is valid but the {getattr(backend, 'provider', '')} account "
+                  "has no credits. Top up billing, or `ugraph auth use ollama` "
+                  "to run locally for free.")
+        return
+
+    print(f"  extracted {res.concepts} concept(s), {len(res.rejected)} rejected by "
+          f"the verbatim gate (attempt {res.attempts})")
+    out = cfg.candidates / f"{slug}.json"
+    try:
+        import json as _json
+        data = _json.loads(out.read_text(encoding="utf-8"))
+        for c in data.get("concepts", []):
+            anchor = str(c.get("anchor", ""))[:8]
+            print(f"    • {c.get('name')}: {str(c.get('claim', ''))[:72]}  [{anchor}]")
+    except Exception:
+        pass
+    print(f"  → {out}")
+
+    promoted = promote_mod.promote_candidate_file(cfg, out)
+    if promoted.written:
+        print(f"  promoted {promoted.written} draft concept(s)")
+        for path in promoted.paths[:12]:
+            print(f"    • {path.relative_to(cfg.kb)}")
+        from ugraph import indexes
+        changed = indexes.write_all(cfg)
+        if changed:
+            print(f"  indexes refreshed ({len(changed)} file(s))")
+
+
+def _run_feed_pipeline(cfg, *, limit: int, channel: str | None,
+                       skip_extract: bool = False) -> None:
+    """After YouTube ingest: Phase A extract → draft concepts → index.
+
+    This is the feed counterpart to capture's `_maybe_synthesize`. The tool owns
+    the pipeline; the user should not have to chain subcommands by hand.
+    """
+    from ugraph import extract as extract_mod
+    from ugraph import indexes
+    from ugraph import promote as promote_mod
+
+    if skip_extract:
+        print("  (synthesis skipped — --no-synthesize)")
+        return
+
+    backend = extract_mod.resolve_backend(cfg)
+    if backend is None:
+        print("  (synthesis skipped — no model configured; run `ugraph auth status`)")
+        return
+
+    model = getattr(backend, "model", "")
+    provider = getattr(backend, "provider", "")
+    label = f"{backend.name}/{provider}" if provider else backend.name
+    print(f"\nSynthesizing with {label} ({model})…")
+
+    def progress(i, total, slug, title):
+        print(f"  [{i}/{total}] {title[:62]}")
+
+    result = extract_mod.run(
+        cfg, backend, limit=limit, progress=progress, channel=channel,
+    )
+    print(f"  extracted {result['written']}/{result['attempted']} "
+          f"→ {result['concepts']} candidate concept(s)")
+    if result["rejected"]:
+        print(f"  {result['rejected']} candidate(s) rejected by the verbatim gate")
+    for failure in result["failed"]:
+        err = failure["error"]
+        print(f"  FAILED {failure['slug']}: {err}")
+        low = err.lower()
+        if "credit" in low or "insufficient_quota" in low or "balance" in low:
+            print("  → API key is valid but the account has no credits.")
+            print("     Top up Anthropic/OpenAI billing, or: ugraph auth use ollama")
+            break
+    if result.get("aborted"):
+        print("  Batch stopped after a billing/auth failure "
+              "(remaining sources were not attempted).")
+        print(f"  Resume:  {result.get('resume')}")
+
+    promoted = promote_mod.promote_pending(cfg, channel=channel, limit=None)
+    print(f"  promoted {promoted.written} draft concept page(s)"
+          f" ({promoted.skipped_existing} already existed)")
+    for path in promoted.paths[:20]:
+        print(f"    • {path.relative_to(cfg.kb)}")
+    if len(promoted.paths) > 20:
+        print(f"    … +{len(promoted.paths) - 20} more")
+
+    changed = indexes.write_all(cfg)
+    if changed:
+        print(f"  indexes refreshed ({len(changed)} file(s))")
+    print("Pipeline done: raw → candidates → draft concepts → indexes")
+
+
+# ---------------------------------------------------------------------------
+# auth — model backends and API keys
+# ---------------------------------------------------------------------------
+
+def cmd_auth(args) -> int:
+    from ugraph import auth as auth_mod
+
+    if args.action == "set":
+        if args.provider not in auth_mod.PROVIDERS:
+            sys.exit(f"ugraph: `auth set` expects one of {auth_mod.PROVIDERS}")
+        import getpass
+        key = getpass.getpass(f"{args.provider} API key (hidden): ")
+        if not key.strip():
+            sys.exit("ugraph: empty key — nothing saved")
+        path = auth_mod.set_key(args.provider, key)
+        print(f"saved {args.provider} key → {path} (permissions 0600)")
+        if not auth_mod.get_backend().get("backend"):
+            auth_mod.set_backend("api")
+            print("default backend set to 'api' (change with `ugraph auth use ollama`)")
+        return 0
+
+    if args.action == "use":
+        if args.provider in auth_mod.PROVIDERS:
+            # `auth use openai` pins the provider within the api backend — the
+            # escape hatch when one key is bad but the other works.
+            auth_mod.set_backend("api", args.model, provider=args.provider)
+            model_note = f" (model: {args.model})" if args.model else ""
+            print(f"default backend: api, provider: {args.provider}{model_note}")
+            return 0
+        if args.provider not in ("api", "ollama"):
+            sys.exit("ugraph: `auth use` expects 'api', 'ollama', 'anthropic' or 'openai'")
+        auth_mod.set_backend(args.provider, args.model)
+        model_note = f" (model: {args.model})" if args.model else ""
+        print(f"default backend: {args.provider}{model_note}")
+        return 0
+
+    # status
+    st = auth_mod.status()
+    print("ugraph auth status")
+    print(f"  config dir: {st['config_dir']}")
+    for provider, source in st["keys"].items():
+        print(f"  {provider:10} key: {source or 'not set'}")
+    backend = st["backend"].get("backend")
+    print(f"  default backend: {backend or 'auto (api if a key exists, else ollama)'}"
+          + (f", model: {st['backend'].get('model')}" if st["backend"].get("model") else ""))
+
+    from ugraph import extract as extract_mod
+    try:
+        extract_mod.OllamaBackend().check()
+        print("  ollama:     reachable at localhost:11434")
+    except extract_mod.BackendError:
+        print("  ollama:     not reachable (install/start it, or set an API key)")
+
+    print("\nNext:")
+    if not any(st["keys"].values()):
+        print("  ugraph auth set anthropic   # or: openai")
+    else:
+        print("  ugraph            # capture now auto-synthesizes")
+        print("  ugraph auth use ollama   # switch to local models")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# ps / logs — live observability over runs.jsonl
+# ---------------------------------------------------------------------------
+
+def _fmt_elapsed(ms: int | None) -> str:
+    if not ms:
+        return "00:00"
+    total = max(0, int(ms) // 1000)
+    return f"{total // 60:02d}:{total % 60:02d}"
+
+
+def _render_ps(rows: list[dict]) -> None:
+    active = sum(1 for r in rows if r.get("active"))
+    print(f"{'MODULE':<9} {'SLUG':<30} {'STEP':<12} {'ELAPSED':<8} "
+          f"{'BACKEND/MODEL':<26} STATUS")
+    for row in rows:
+        backend = row.get("backend", "")
+        model = row.get("model", "")
+        engine = f"{backend}/{model}" if model else backend
+        if row.get("active"):
+            status = "active"
+        elif row.get("stale"):
+            status = "stale (killed)"
+        else:
+            status = row.get("event", "?")
+        print(f"{row.get('module', '?'):<9} "
+              f"{str(row.get('slug', '-'))[:30]:<30} "
+              f"{str(row.get('step', row.get('event', '')))[:12]:<12} "
+              f"{_fmt_elapsed(row.get('elapsed_ms')):<8} "
+              f"{engine[:26]:<26} {status}")
+    print(f"\n{len(rows)} run(s) · {active} active")
+
+
+def cmd_ps(args) -> int:
+    cfg = _config(args)
+    from ugraph import runs as runs_mod
+
+    def once() -> None:
+        rows = runs_mod.latest_per_run(cfg)[: args.limit]
+        if args.json:
+            print(json.dumps(rows, indent=2, default=str))
+        else:
+            _render_ps(rows)
+
+    if args.watch is None:
+        once()
+        return 0
+
+    interval = args.watch or 2
+    try:
+        while True:
+            print("\033[2J\033[H", end="")
+            once()
+            print(f"\n(refreshing every {interval}s — Ctrl+C to stop)")
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        return 0
+
+
+def cmd_logs(args) -> int:
+    cfg = _config(args)
+    from ugraph import runs as runs_mod
+
+    events = (runs_mod.for_slug(cfg, args.slug, limit=args.limit)
+              if args.slug else runs_mod.read(cfg, limit=args.limit))
+    if args.json:
+        print(json.dumps(events, indent=2, default=str))
+        return 0
+
+    skip = {"ts", "run", "module", "event", "slug", "elapsed_ms", "step"}
+    for event in events:
+        stamp = str(event.get("ts", ""))[11:19]
+        step = event.get("step") or event.get("event", "")
+        detail = " ".join(
+            f"{k}={str(v)[:60]}" for k, v in event.items() if k not in skip
+        )
+        elapsed = _fmt_elapsed(event.get("elapsed_ms"))
+        print(f"{stamp} {event.get('module', '?'):<8} {step:<12} {elapsed:>7}  {detail}")
+    if not events:
+        print("no runs recorded yet — events appear here after your next ugraph run")
     return 0
 
 
@@ -613,11 +1047,35 @@ def cmd_extract(args) -> int:
         # Not a warning about the KB — a measurement of the model. The gate did its job.
         print(f"  {result['rejected']} candidate(s) rejected as not verbatim")
     for failure in result["failed"]:
-        print(f"  FAILED {failure['slug']}: {failure['error']}")
+        err = failure["error"]
+        print(f"  FAILED {failure['slug']}: {err}")
+        low = err.lower()
+        if "credit" in low or "insufficient_quota" in low or "balance" in low:
+            print("  → API key is valid but the account has no credits.")
+            print("     Top up Anthropic/OpenAI billing, or: ugraph auth use ollama")
+            break
+    if result.get("aborted"):
+        print("Batch stopped after a billing/auth failure "
+              "(remaining sources were not attempted).")
+        print(f"Resume:  {result.get('resume')}")
+
+    # Draft concept pages are the tool-owned half of Phase B. Cross-talk merge
+    # still wants an agent; one-concept-per-candidate drafts do not.
     if result["written"]:
-        print()
-        print("Next: the merge step needs an agent — see `ugraph skills install`")
-    return 1 if result["failed"] else 0
+        from ugraph import indexes
+        from ugraph import promote as promote_mod
+
+        promoted = promote_mod.promote_pending(
+            cfg, channel=sel.get("channel"), limit=None,
+        )
+        print(f"  promoted {promoted.written} draft concept page(s)"
+              f" ({promoted.skipped_existing} already existed)")
+        for path in promoted.paths[:20]:
+            print(f"    • {path.relative_to(cfg.kb)}")
+        changed = indexes.write_all(cfg)
+        if changed:
+            print(f"  indexes refreshed ({len(changed)} file(s))")
+    return 1 if result["failed"] or result.get("aborted") else 0
 
 
 # ---------------------------------------------------------------------------
@@ -689,7 +1147,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--version", action="version", version=f"ugraph-kit {__version__}")
     p.add_argument("--kb", metavar="PATH",
                    help="knowledge base root (default: ugraph.toml, $UGRAPH_KB, or cwd)")
-    p.set_defaults(func=cmd_smart)
+    p.add_argument("--yes", "-y", action="store_true",
+                   help="skip the ingest confirmation prompt (bare ugraph / capture)")
+    # Bare `ugraph` is the daily capture flow: copy → preview → confirm → act.
+    p.set_defaults(func=cmd_capture)
     sub = p.add_subparsers(dest="command")
 
     sp = sub.add_parser("init", help="scaffold a new knowledge base")
@@ -699,7 +1160,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_init)
 
     sp = sub.add_parser("ingest", help="fetch source material")
-    sp.add_argument("source", choices=["youtube"])
+    sp.add_argument("source", choices=["youtube", "file"])
     sp.add_argument("url")
     sp.add_argument("--limit", type=int, default=10, help="max NEW items this run")
     # No --since here: yt-dlp's flat playlist listing returns NA for upload_date, so a
@@ -714,18 +1175,73 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--force", action="store_true", help="re-fetch items already recorded")
     sp.add_argument("--retry-failed", action="store_true",
                     help="reconsider videos recorded as unfetchable")
-    sp.set_defaults(func=cmd_ingest)
+    sp.add_argument("--repair-state", action="store_true",
+                    help="drop ingested IDs with no raw transcript so missing "
+                         "videos can be re-fetched (does not download)")
+    sp.add_argument("--no-synthesize", action="store_true",
+                    help="stop after transcripts; skip extract + draft concepts")
+    sp.set_defaults(func=cmd_ingest, synthesize=False)
+
+    sp = sub.add_parser("capture", help="ingest text from stdin or clipboard (M0)")
+    sp.add_argument("--title", help="human title (defaults to slug)")
+    sp.add_argument("--slug", help="document slug")
+    sp.add_argument("--clipboard", action="store_true", help="read from clipboard instead of stdin")
+    sp.add_argument("--yes", "-y", action="store_true",
+                    help="skip the ingest confirmation prompt")
+    sp.set_defaults(func=cmd_capture)
+
+    sp = sub.add_parser(
+        "embed",
+        help="local embeddings with chunk-hash reuse (paper §3.2)",
+    )
+    sp.add_argument("--slug", help="embed one document; default: every ingested doc")
+    sp.add_argument("--model", default=None,
+                    help="Ollama embed model (default: nomic-embed-text)")
+    sp.add_argument("--host", default=None, help="Ollama host (default: http://127.0.0.1:11434)")
+    sp.add_argument("--no-reuse", action="store_true",
+                    help="re-encode every chunk (ablation / forced refresh)")
+    sp.add_argument("--bench", action="store_true",
+                    help="compare reuse on vs off for append and mid-file edits")
+    sp.add_argument("--chunks", type=int, default=16,
+                    help="paragraphs in the --bench corpus (default: 16)")
+    sp.add_argument("--fake", action="store_true",
+                    help="use a deterministic fake encoder (no Ollama; for CI)")
+    sp.add_argument("--fake-delay-ms", type=float, default=5.0,
+                    help="per-chunk delay for --fake (default: 5)")
+    sp.set_defaults(func=cmd_embed)
 
     sp = sub.add_parser(
         "person",
         help="resolve a person from a YouTube link and add them to the KB",
     )
-    sp.add_argument("url", nargs="?",
-                    help="video/channel/profile URL (defaults to clipboard)")
+    sp.add_argument(
+        "url", nargs="?",
+        help="video/channel/profile URL (defaults to clipboard)",
+    )
     sp.add_argument("--name", help="override the resolved display name")
     sp.add_argument("--yes", "-y", action="store_true",
                     help="write without interactive confirmation")
     sp.set_defaults(func=cmd_person)
+
+    sp = sub.add_parser("auth", help="configure model backends and API keys")
+    sp.add_argument("action", choices=["set", "status", "use"], nargs="?", default="status")
+    sp.add_argument("provider", nargs="?",
+                    choices=["anthropic", "openai", "api", "ollama"])
+    sp.add_argument("--model", help="model override for `auth use`")
+    sp.set_defaults(func=cmd_auth)
+
+    sp = sub.add_parser("ps", help="live view of running and recent jobs")
+    sp.add_argument("--watch", "-w", type=int, nargs="?", const=2, metavar="SEC",
+                    help="re-render every SEC seconds (default 2)")
+    sp.add_argument("--limit", type=int, default=20)
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_ps)
+
+    sp = sub.add_parser("logs", help="event trail for one item, or recent runs")
+    sp.add_argument("slug", nargs="?")
+    sp.add_argument("--limit", type=int, default=50)
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_logs)
 
     sp = sub.add_parser("index", help="regenerate every index.md")
     sp.add_argument("--check", action="store_true", help="exit 1 if stale; write nothing")

@@ -1,10 +1,15 @@
-"""Resolve a person from a YouTube URL and add a minimal, verified KB record."""
+"""Resolve a person from a public profile/source URL and add them to the KB.
+
+V1 deliberately supports YouTube only. Metadata comes from yt-dlp, not an LLM:
+the command may identify the channel attached to a supplied video, but it never
+invents a biography. The canonical record lives in ``entities/people`` and a
+small compatibility redirect is written to ``resources/people``.
+"""
 
 from __future__ import annotations
 
 import json
 import re
-import shutil
 import subprocess
 from dataclasses import dataclass
 from datetime import date
@@ -12,13 +17,15 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from ugraph.config import Config
+from ugraph.sources.youtube import YT_DLP, _require_yt_dlp
 from ugraph.store import read_md, slugify, write_md
+
 
 YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"}
 
 
 class PersonResolutionError(RuntimeError):
-    """The supplied URL could not be resolved to one verified identity."""
+    pass
 
 
 @dataclass(frozen=True)
@@ -28,6 +35,7 @@ class Person:
     profile_url: str
     source_url: str
     source_title: str
+    platform: str = "youtube"
 
 
 @dataclass(frozen=True)
@@ -39,7 +47,7 @@ class AddPersonResult:
 
 
 def is_supported_url(value: str) -> bool:
-    """Return whether value is exactly one HTTP(S) YouTube URL."""
+    """True only for one HTTP(S) YouTube URL, not arbitrary pasted prose."""
     value = value.strip()
     if not value or any(ch.isspace() for ch in value):
         return False
@@ -51,28 +59,22 @@ def is_supported_url(value: str) -> bool:
 
 
 def resolve(url: str) -> Person:
-    """Resolve channel identity deterministically through yt-dlp, never an LLM."""
+    """Resolve the creator/channel attached to a YouTube URL using yt-dlp."""
     if not is_supported_url(url):
-        raise PersonResolutionError("v1 supports YouTube video, channel, and profile URLs only")
-    if shutil.which("yt-dlp") is None:
         raise PersonResolutionError(
-            "yt-dlp is unavailable; reinstall ugraph-kit or install yt-dlp"
+            "v1 supports YouTube video, channel, and profile URLs only"
         )
-
-    result = subprocess.run(
-        [
-            "yt-dlp",
-            "--skip-download",
-            "--no-warnings",
-            "--playlist-items",
-            "1",
-            "--dump-single-json",
-            url.strip(),
-        ],
-        capture_output=True,
-        text=True,
-        timeout=90,
-    )
+    _require_yt_dlp()
+    cmd = [
+        YT_DLP,
+        "--skip-download",
+        "--no-warnings",
+        "--playlist-items",
+        "1",
+        "--dump-single-json",
+        url.strip(),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
     if result.returncode != 0:
         detail = result.stderr.strip()[-500:] or "unknown yt-dlp error"
         raise PersonResolutionError(f"could not read YouTube metadata: {detail}")
@@ -81,6 +83,8 @@ def resolve(url: str) -> Person:
     except json.JSONDecodeError as exc:
         raise PersonResolutionError("YouTube metadata was not valid JSON") from exc
 
+    # A channel URL returns a playlist whose first entry may hold the useful
+    # uploader fields. Prefer top-level values, then the first entry.
     entry = (data.get("entries") or [{}])[0] or {}
 
     def first(*keys: str) -> str:
@@ -93,24 +97,38 @@ def resolve(url: str) -> Person:
     name = first("channel", "uploader", "playlist_uploader")
     handle = first("uploader_id", "channel_id")
     profile_url = first("channel_url", "uploader_url")
-    title = first("title", "playlist_title") or "YouTube source"
+    title = first("title", "playlist_title")
+    # Preserve the exact supplied URL, including a video timestamp. That is the
+    # user's reason for saving this person and is more useful than yt-dlp's
+    # canonical URL with the query stripped.
+    source_url = url.strip()
 
     if handle and not handle.startswith("@") and profile_url:
         match = re.search(r"youtube\.com/(@[^/?#]+)", profile_url)
         if match:
             handle = match.group(1)
     if not name:
-        raise PersonResolutionError("YouTube returned no creator/channel name for this URL")
+        raise PersonResolutionError(
+            "YouTube returned no creator/channel name for this URL"
+        )
     if not profile_url and handle.startswith("@"):
         profile_url = f"https://www.youtube.com/{handle}"
     if not profile_url:
-        raise PersonResolutionError("YouTube returned no creator profile URL for this source")
+        raise PersonResolutionError(
+            "YouTube returned no creator profile URL for this source"
+        )
 
-    # Keep the exact URL, including ?t=. That moment is often why the user saved it.
-    return Person(name, handle, profile_url, url.strip(), title)
+    return Person(
+        name=name,
+        handle=handle,
+        profile_url=profile_url,
+        source_url=source_url,
+        source_title=title or "YouTube source",
+    )
 
 
 def _existing_for(config: Config, person: Person) -> Path | None:
+    """Find an existing canonical page by profile URL or handle."""
     directory = config.entities / "people"
     if not directory.is_dir():
         return None
@@ -119,18 +137,16 @@ def _existing_for(config: Config, person: Person) -> Path | None:
     for path in directory.glob("*.md"):
         try:
             meta, _ = read_md(path)
-        except Exception as exc:
-            raise PersonResolutionError(
-                f"cannot inspect existing person page {path}: {exc}"
-            ) from exc
+        except Exception:
+            continue
         resource = str(meta.get("resource") or "").rstrip("/").casefold()
-        handles = {str(handle).casefold() for handle in (meta.get("handles") or [])}
+        handles = {str(h).casefold() for h in (meta.get("handles") or [])}
         if resource == target_url or (target_handle and target_handle in handles):
             return path
     return None
 
 
-def _slug(config: Config, person: Person) -> str:
+def _canonical_slug(config: Config, person: Person) -> str:
     existing = _existing_for(config, person)
     if existing:
         return existing.stem
@@ -142,32 +158,37 @@ def _slug(config: Config, person: Person) -> str:
     return f"{base}-{suffix}"
 
 
-def _write_redirect(config: Config, slug: str, person: Person) -> Path:
+def _write_redirect(config: Config, slug: str, person: Person,
+                    canonical_path: Path) -> Path:
     redirect = config.kb / "resources" / "people" / f"{slug}.md"
-    relative = f"../../entities/people/{slug}.md"
+    relative = Path("../../entities/people") / canonical_path.name
     body = (
         f"# {person.name}\n\n"
         "> **This note moved.** Its content now lives at\n"
-        f"> [{person.name}]({relative}) as part of the knowledge base.\n\n"
-        "This stub exists only so existing links elsewhere in the vault keep resolving.\n"
-        "Don't add content here — edit the canonical page instead."
+        f"> [{person.name}]({relative.as_posix()}) as part of the OKF knowledge base.\n\n"
+        "This stub exists only so `[[wikilinks]]` elsewhere in the vault keep\n"
+        "resolving. Don't add content here — edit the canonical page instead."
     )
-    return write_md(
-        redirect,
-        body,
-        {
-            "type": "overview",
-            "title": person.name,
-            "description": "Redirect to the canonical person page.",
-            "moved_to": relative,
-            "updated": date.today().isoformat(),
-        },
-    )
+    write_md(redirect, body, {
+        "type": "overview",
+        "title": person.name,
+        "description": (
+            "Moved — redirect stub kept so existing [[wikilinks]] elsewhere "
+            "in the vault still resolve."
+        ),
+        "moved_to": relative.as_posix(),
+        "updated": date.today().isoformat(),
+    })
+    return redirect
 
 
 def add(config: Config, person: Person) -> AddPersonResult:
-    """Create a canonical page once; repeated calls never overwrite human edits."""
-    slug = _slug(config, person)
+    """Create the canonical person page and compatibility redirect.
+
+    Existing canonical content is never rewritten. Repeating a command only
+    repairs/refreshes the redirect, making the operation safe and idempotent.
+    """
+    slug = _canonical_slug(config, person)
     canonical = config.entities / "people" / f"{slug}.md"
     created = not canonical.exists()
     today = date.today().isoformat()
@@ -182,22 +203,20 @@ def add(config: Config, person: Person) -> AddPersonResult:
             "## Discovered from\n\n"
             f"- [{person.source_title}]({person.source_url})\n"
         )
-        write_md(
-            canonical,
-            body,
-            {
-                "type": "entity",
-                "subtype": "person",
-                "title": person.name,
-                "description": f"YouTube creator{handle_note}; added from a supplied source.",
-                "resource": person.profile_url,
-                "handles": [person.handle] if person.handle else [],
-                "tags": ["youtube"],
-                "discovered_from": [person.source_url],
-                "created": today,
-                "updated": today,
-            },
-        )
+        write_md(canonical, body, {
+            "type": "entity",
+            "subtype": "person",
+            "title": person.name,
+            "description": (
+                f"YouTube creator{handle_note}; added from a user-supplied source."
+            ),
+            "resource": person.profile_url,
+            "handles": [person.handle] if person.handle else [],
+            "tags": ["youtube"],
+            "discovered_from": [person.source_url],
+            "created": today,
+            "updated": today,
+        })
 
-    redirect = _write_redirect(config, slug, person)
+    redirect = _write_redirect(config, slug, person, canonical)
     return AddPersonResult(person, canonical, redirect, created)

@@ -111,7 +111,16 @@ def collect(config: Config, newest: int | None = None, since: date | None = None
                                     channel=channel)
     candidates, broken = _load_candidates(config)
 
-    extracted = [s for s in sources if str(s.meta.get("summary_status", "")) == "done"]
+    # Align with extract.pending_sources: a source is "extracted" once a candidate
+    # JSON exists (or a human marked summary_status done). Waiting only on
+    # summary_status==done left every successful Phase A still counting as pending.
+    def _is_extracted(source: Page) -> bool:
+        if str(source.meta.get("summary_status", "")) == "done":
+            return True
+        slug = str(source.meta.get("slug") or source.id)
+        return Path(slug).name in candidates or source.path.stem in candidates
+
+    extracted = [s for s in sources if _is_extracted(s)]
     extracted_ids = {id(s) for s in extracted}
     pending = [s for s in sources if id(s) not in extracted_ids]
 

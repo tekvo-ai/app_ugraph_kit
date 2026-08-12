@@ -45,7 +45,7 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
-from ugraph import ledger, select, templates
+from ugraph import ledger, runs, select, templates
 from ugraph.config import Config
 from ugraph.model import Page, iter_pages
 from ugraph.store import read_md
@@ -200,22 +200,39 @@ class OllamaBackend(Backend):
 
 
 class ApiBackend(Backend):
-    """Anthropic or OpenAI. Imported lazily so the core install never needs them."""
+    """Anthropic or OpenAI. Imported lazily so the core install never needs them.
+
+    Keys resolve through ugraph.auth: env var first, then ~/.config/ugraph/keys.toml
+    (written by `ugraph auth set`). The key is passed to the client explicitly rather
+    than relying on the SDK's env lookup, so a keys-file user and an env user get
+    identical behavior.
+    """
 
     name = "api"
 
     def __init__(self, model: str | None = None):
-        self.provider = "anthropic" if os.environ.get("ANTHROPIC_API_KEY") else (
-            "openai" if os.environ.get("OPENAI_API_KEY") else "")
-        self.model = model or ("claude-sonnet-4-5" if self.provider == "anthropic"
-                               else "gpt-4o-mini")
+        from ugraph import auth
+
+        # `ugraph auth use openai` pins a provider; otherwise first key wins.
+        preferred = auth.get_backend().get("provider")
+        order = ([preferred] + [p for p in auth.PROVIDERS if p != preferred]
+                 if preferred else list(auth.PROVIDERS))
+
+        self.provider = ""
+        self.api_key: str | None = None
+        for candidate in order:
+            key = auth.get_key(candidate)
+            if key:
+                self.provider, self.api_key = candidate, key
+                break
+        self.model = model or auth.default_model(self.provider)
 
     def check(self) -> None:
         if not self.provider:
             raise BackendError(
                 "no API key found.\n"
-                "  Set ANTHROPIC_API_KEY or OPENAI_API_KEY, or use "
-                "`--backend ollama` to run locally."
+                "  Run `ugraph auth set anthropic` or `ugraph auth set openai`,\n"
+                "  or use `--backend ollama` to run locally."
             )
         try:
             __import__(self.provider)
@@ -228,7 +245,7 @@ class ApiBackend(Backend):
     def complete(self, system: str, user: str) -> str:
         if self.provider == "anthropic":
             import anthropic
-            client = anthropic.Anthropic()
+            client = anthropic.Anthropic(api_key=self.api_key)
             msg = client.messages.create(
                 model=self.model, max_tokens=8000, system=system,
                 messages=[{"role": "user", "content": user}],
@@ -236,7 +253,7 @@ class ApiBackend(Backend):
             return "".join(b.text for b in msg.content if b.type == "text")
 
         import openai
-        client = openai.OpenAI()
+        client = openai.OpenAI(api_key=self.api_key)
         msg = client.chat.completions.create(
             model=self.model, temperature=0.1,
             messages=[{"role": "system", "content": system},
@@ -256,6 +273,37 @@ def make_backend(name: str, model: str | None = None) -> Backend:
     backend = cls(model) if model else cls()
     backend.check()
     return backend
+
+
+def resolve_backend(config: Config, requested: str | None = None,
+                    model: str | None = None) -> Backend | None:
+    """The backend a command should use, or None if nothing is configured.
+
+    Order: explicit flag → [extract].backend in ugraph.toml → `ugraph auth use`
+    preference → auto-detect (any API key, else a reachable Ollama). None means
+    "not set up", which is a hint to print, not an error to raise.
+    """
+    from ugraph import auth
+
+    name = requested or config.raw.get("extract", {}).get("backend") \
+        or auth.get_backend().get("backend") or ""
+    model = model or auth.get_backend().get("model")
+
+    if not name:
+        if any(auth.get_key(p) for p in auth.PROVIDERS):
+            name = "api"
+        else:
+            try:
+                OllamaBackend().check()
+                name = "ollama"
+            except BackendError:
+                return None
+    if name == "claude-code":
+        return None  # guidance-only backend: no programmatic run
+    try:
+        return make_backend(name, model)
+    except BackendError:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -394,6 +442,30 @@ def spec() -> str:
                           kind="skills")
 
 
+# Provider failures that will not fix themselves mid-batch. Keep hammering the
+# rest of `--limit` burns credits/quota for nothing — abort and let the user resume.
+_HARD_PROVIDER_MARKERS = (
+    "credit balance",
+    "too low to access",
+    "insufficient_quota",
+    "invalid_api_key",
+    "authentication_error",
+    "permission_error",
+    "billing",
+    "unauthorized",
+    "invalid x-api-key",
+    "401",
+    "403",
+)
+
+
+def is_hard_provider_failure(error: str | None) -> bool:
+    if not error:
+        return False
+    low = error.lower()
+    return any(marker in low for marker in _HARD_PROVIDER_MARKERS)
+
+
 def extract_one(config: Config, page: Page, backend: Backend,
                 system: str) -> ExtractResult:
     slug = str(page.meta.get("slug") or page.id)
@@ -453,6 +525,12 @@ def extract_one(config: Config, page: Page, backend: Backend,
         result.written = True
         result.concepts = len(kept)
         try:
+            from ugraph import promote as promote_mod
+
+            promote_mod.mark_source_extracted(config, slug)
+        except Exception:
+            pass
+        try:
             ledger.record(config, slug, "extracted", by=f"ugraph extract ({backend.name})",
                           detail=f"{len(kept)} concepts, {len(rejected)} rejected")
         except Exception:  # bookkeeping must not fail a successful extraction
@@ -472,11 +550,25 @@ def run(config: Config, backend: Backend, limit: int = 10,
     batch = pending_sources(config, newest=newest, since=since, channel=channel)[:limit]
 
     results = []
+    aborted = False
+    abort_error: str | None = None
     for i, page in enumerate(batch, 1):
         slug = str(page.meta.get("slug") or page.id)
         if progress:
             progress(i, len(batch), slug, page.title)
-        results.append(extract_one(config, page, backend, system))
+        one = extract_one(config, page, backend, system)
+        results.append(one)
+        if not one.written and is_hard_provider_failure(one.error):
+            aborted = True
+            abort_error = one.error
+            break
+
+    resume_parts = ["ugraph extract"]
+    if backend.name:
+        resume_parts.append(f"--backend {backend.name}")
+    if channel:
+        resume_parts.append(f"--channel {channel}")
+    resume_parts.append(f"--limit {limit}")
 
     return {
         "backend": backend.name,
@@ -485,5 +577,213 @@ def run(config: Config, backend: Backend, limit: int = 10,
         "concepts": sum(r.concepts for r in results),
         "rejected": sum(len(r.rejected) for r in results),
         "failed": [{"slug": r.slug, "error": r.error} for r in results if not r.written],
+        "aborted": aborted,
+        "abort_error": abort_error,
+        "resume": " ".join(resume_parts),
         "results": results,
     }
+
+
+# ---------------------------------------------------------------------------
+# Text documents (no timestamps) — anchors are content-addressed chunks
+# ---------------------------------------------------------------------------
+#
+# Pasted text has no [HH:MM:SS] markers, so the transcript gate cannot run. But M0
+# ingest already gives every paragraph a content-addressed chunk id, which is a
+# *better* citation than a timestamp: it survives edits to other parts of the doc.
+# The model never invents anchors — the gate derives them, same as timestamps.
+
+TEXT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "yield": {"type": "string", "enum": ["high", "medium", "low", "none"]},
+        "concepts": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "claim": {"type": "string"},
+                    "verbatim_quote": {"type": "string"},
+                },
+                "required": ["name", "claim", "verbatim_quote"],
+            },
+        },
+    },
+    "required": ["yield", "concepts"],
+}
+
+
+def gate_text(candidate: dict, chunks: Sequence[tuple[str, str]]) -> tuple[list[dict], list[str]]:
+    """Keep concepts whose quote is verbatim in exactly one chunk; anchor them.
+
+    `chunks` is [(chunk_id, normalized_text)]. A quote found in no chunk is a
+    fabrication; found in two or more it cannot be cited to one place. Both are
+    rejected — identical philosophy to the transcript gate.
+    """
+    kept, rejected = [], []
+    for concept in candidate.get("concepts") or []:
+        name = str(concept.get("name", "?"))
+        quote = _norm(concept.get("verbatim_quote", ""))
+        if not quote:
+            rejected.append(f"{name}: no quote")
+            continue
+        hits = [cid for cid, text in chunks if quote in text]
+        if not hits:
+            rejected.append(f"{name}: quote is not verbatim")
+            continue
+        if len(hits) > 1:
+            rejected.append(f"{name}: quote spans chunks, cannot cite one")
+            continue
+        concept["anchor"] = hits[0]
+        kept.append(concept)
+    return kept, rejected
+
+
+def _dedupe_concepts(concepts: list[dict]) -> list[dict]:
+    """Drop exact repeats — grouped extraction can surface the same concept
+    with the same evidence from overlapping context in different groups."""
+    seen: set[tuple[str, str, str]] = set()
+    out: list[dict] = []
+    for c in concepts:
+        key = (str(c.get("name", "")).strip().lower(),
+               _norm(c.get("claim", "")), _norm(c.get("verbatim_quote", "")))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(c)
+    return out
+
+
+def text_spec() -> str:
+    return templates.read("channel-to-kb/references/candidate-extraction-text.md",
+                          kind="skills")
+
+
+# Documents larger than this are extracted chunk-group by chunk-group rather than
+# in one call. Whole-document extraction doesn't scale on small local models:
+# the JSON response for a dense 10KB article outgrows the context window mid-
+# generation (observed: qwen2.5-coder:7b truncated at 4K+ output tokens after
+# 22 min), the repair attempt re-hits the same wall, and the run burns ~40 min
+# for a guaranteed failure. Small prompts keep responses well inside the window.
+CHUNKED_DOC_CHARS = 5000
+GROUP_CHARS = 3500
+
+
+def _groups(chunk_pairs: list[tuple[str, str]],
+            max_chars: int) -> list[list[tuple[str, str]]]:
+    groups: list[list[tuple[str, str]]] = []
+    cur: list[tuple[str, str]] = []
+    size = 0
+    for cid, text in chunk_pairs:
+        if cur and size + len(text) > max_chars:
+            groups.append(cur)
+            cur, size = [], 0
+        cur.append((cid, text))
+        size += len(text)
+    if cur:
+        groups.append(cur)
+    return groups
+
+
+def extract_document(config: Config, slug: str, backend: Backend) -> ExtractResult:
+    """Phase A for a pasted/captured text document (raw/<slug>.md)."""
+    from ugraph import ingest as ingest_mod
+    from ugraph import ledger as ledger_mod
+
+    result = ExtractResult(slug=slug)
+    raw_path = config.raw_dir / f"{slug}.md"
+    if not raw_path.is_file():
+        result.error = f"no raw document for slug {slug!r}"
+        return result
+
+    meta, body = read_md(raw_path)
+    chunk_pairs = [
+        (ingest_mod.content_id(block, slug), _norm(block))
+        for block in ingest_mod.chunk_text(body)
+    ]
+    if not chunk_pairs:
+        result.error = "document has no content"
+        return result
+
+    system = text_spec()
+    total_chars = sum(len(text) for _, text in chunk_pairs)
+    groups = ([chunk_pairs] if total_chars <= CHUNKED_DOC_CHARS
+              else _groups(chunk_pairs, GROUP_CHARS))
+
+    def build_user(group: list[tuple[str, str]]) -> str:
+        numbered = "\n\n".join(
+            f"--- CHUNK {cid} ---\n{text}" for cid, text in group
+        )
+        return (
+            f"Document slug: {slug}\n"
+            f"Title: {meta.get('title', slug)}\n\n"
+            "Return ONLY the JSON object described in the spec. No prose, no code fence.\n\n"
+            f"--- DOCUMENT ---\n{numbered}"
+        )
+
+    with runs.Run(config, "extract", slug, backend=backend.name,
+                  model=getattr(backend, "model", "")) as run:
+        concepts_all: list = []
+        for gi, group in enumerate(groups, 1):
+            user = build_user(group)
+            for attempt in range(1, MAX_ATTEMPTS + 1):
+                result.attempts += 1
+                run.stage("attempt", attempt=attempt, group=gi, groups=len(groups))
+                try:
+                    raw = backend.complete(system, user)
+                except Exception as exc:
+                    result.error = f"{type(exc).__name__}: {exc}"
+                    run.fail(result.error, attempt=attempt, group=gi)
+                    return result
+
+                candidate = parse_json(raw)
+                if candidate is None:
+                    result.error = "response was not JSON"
+                    run.stage("parse-error", attempt=attempt, group=gi)
+                    continue
+                if not isinstance(candidate.get("concepts"), list):
+                    result.error = ("response had no 'concepts' list — the model answered in "
+                                    "its own schema")
+                    run.stage("schema-error", attempt=attempt, group=gi)
+                    continue
+
+                concepts_all.extend(candidate["concepts"])
+                break
+            else:
+                # One group failing shouldn't sink the whole document: the other
+                # groups' concepts still gate and write. The run events record it.
+                run.stage("group-failed", group=gi, groups=len(groups))
+
+        if not concepts_all and result.error:
+            run.fail(result.error, attempt=result.attempts)
+            return result
+
+        candidate = {"concepts": concepts_all}
+        kept, rejected = gate_text(candidate, chunk_pairs)
+        kept = _dedupe_concepts(kept)
+        result.rejected = rejected
+        run.stage("gate", kept=len(kept), rejected=len(rejected))
+
+        candidate["concepts"] = kept
+        candidate.setdefault("slug", slug)
+        candidate.setdefault("title", meta.get("title", slug))
+        candidate.setdefault("source_type", meta.get("source_type", "copy-paste"))
+        if not kept:
+            candidate.setdefault("yield", "none")
+
+        out = config.candidates / f"{Path(slug).name}.json"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(candidate, indent=2, ensure_ascii=False) + "\n",
+                       encoding="utf-8")
+        run.stage("write", path=str(out), concepts=len(kept))
+
+        result.written = True
+        result.concepts = len(kept)
+        try:
+            ledger_mod.record(config, slug, "extracted",
+                              by=f"ugraph capture ({backend.name})",
+                              detail=f"{len(kept)} concepts, {len(rejected)} rejected")
+        except Exception:
+            pass
+        return result

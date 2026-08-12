@@ -117,9 +117,16 @@ The current test suite enforces:
 Operational events are appended to `runs.jsonl` and exposed through
 `ugraph ps` and `ugraph logs`.
 
+## Source
+
+Canonical repo (Tekvo open source): https://github.com/tekvo-ai/app_ugraph_kit  
+Site: https://ugraph.build
+
 ## Development
 
 ```bash
+git clone https://github.com/tekvo-ai/app_ugraph_kit.git
+cd app_ugraph_kit
 uv sync --extra dev
 uv run pytest
 uv build

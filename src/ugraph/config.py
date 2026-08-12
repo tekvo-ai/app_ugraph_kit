@@ -161,6 +161,12 @@ def load(kb: str | Path | None = None, start: Path | None = None) -> Config:
     config_path = None
     if kb is not None:
         config_path = find_config(Path(kb).expanduser())
+    elif os.environ.get("UGRAPH_KB"):
+        # The env var names a KB just as explicitly as --kb does. Skipping the
+        # config search here meant UGRAPH_KB users silently lost every vault
+        # setting — candidates/, taxonomy, log_dir — while the KB itself loaded
+        # fine, which is the worst kind of configuration bug: invisible.
+        config_path = find_config(Path(os.environ["UGRAPH_KB"]).expanduser())
     if config_path is None:
         config_path = find_config(start)
 

@@ -1,5 +1,5 @@
 {
-  "_comment": "Drives index.md grouping and the closed `domain` vocabulary. Edit here, then run `ugraph index`. Anything unmatched lands under 'Other' \u2014 never silently dropped.",
+  "_comment": "Closed vocabulary used for validation and generated index grouping.",
   "domains": {
     "agentic_systems": "Agentic Systems",
     "ai_engineering": "AI Engineering",
@@ -25,7 +25,6 @@
     "person": "People",
     "organization": "Organizations"
   },
-  "_entity_dirs_comment": "subtype -> directory name. Explicit because naive pluralization gives 'persons'.",
   "entity_dirs": {
     "tool": "tools",
     "person": "people",
@@ -40,6 +39,6 @@
     "course": "Courses",
     "book": "Books"
   },
-  "_page_types_comment": "Page types beyond the format's built-ins (concept, entity, source, raw-transcript, moc, overview, note). Values list EXTRA required frontmatter fields; `type` and `title` are always required. Built-in types cannot be weakened here \u2014 the toolchain depends on them.",
+  "moc_for_domain": {},
   "page_types": {}
 }
