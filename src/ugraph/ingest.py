@@ -8,7 +8,8 @@ make them pass:
   3. killing ingestion mid-document and rerunning completes cleanly
 
 Layout:
-    <kb>/raw/<slug>.md                 # source of truth (markdown)
+    <kb>/raw/<slug>.md                 # immutable capture (markdown)
+    <kb>/sources/<slug>.md             # provenance stub (ledger / lint)
     <kb>/.ugraph/chunks/<slug>/<chunk_id>.md
     <kb>/.ugraph/state/ingest-<slug>.json
 
@@ -26,7 +27,7 @@ from typing import Any, Iterable
 
 from ugraph import runs
 from ugraph.config import Config
-from ugraph.store import State, iso, slugify, write_md
+from ugraph.store import State, iso, read_md, slugify, write_md
 
 JOB = "ingest"
 CHUNK_SUFFIX = ".md"
@@ -133,6 +134,67 @@ def _write_raw(cfg: Config, slug: str, text: str, meta: dict[str, Any]) -> Path:
     return raw_path
 
 
+def _write_source_stub(
+    cfg: Config,
+    slug: str,
+    *,
+    title: str,
+    source_uri: str,
+    source_type: str,
+) -> Path:
+    """Pair every raw capture with a sources/ page so lint + ledger stay honest.
+
+    Re-ingest must not clobber a finished summary the same way YouTube stubs
+    preserve `summary_status: done`.
+    """
+    path = cfg.sources / f"{slug}.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing: dict[str, Any] = {}
+    if path.exists():
+        existing, _ = read_md(path)
+
+    today = iso()
+    summarized = existing.get("summary_status") == "done"
+    description = (
+        existing.get("description")
+        if summarized
+        else "Not yet summarized — run extract to draft concepts from this capture."
+    )
+    raw_rel = f"../raw/{slug}.md"
+    body = [
+        f"# {title}",
+        "",
+        f"**{source_type}** · `{source_uri}`",
+        "",
+    ]
+    if not summarized:
+        body += [
+            "> **Stub.** Capture is on disk; concept extraction has not run yet.",
+            f"> Full text: [raw]({raw_rel})",
+            "",
+        ]
+    else:
+        body += [f"See [raw]({raw_rel}).", ""]
+
+    write_md(
+        path,
+        "\n".join(body),
+        {
+            "type": "source",
+            "source_type": source_type,
+            "title": title,
+            "description": description,
+            "slug": slug,
+            "url": source_uri if source_uri.startswith("http") else "",
+            "raw": raw_rel,
+            "summary_status": existing.get("summary_status", "pending"),
+            "created": existing.get("created") or today,
+            "updated": today,
+        },
+    )
+    return path
+
+
 def _state(cfg: Config, slug: str) -> State:
     return State(_state_dir(cfg), f"{JOB}-{slug}")
 
@@ -154,20 +216,29 @@ def ingest_document(
     """
     slug = slugify(slug or title or "capture")
     with runs.Run(cfg, "ingest", slug, source_type=source_type) as run:
+        display_title = title or slug
         raw_path = _write_raw(
             cfg,
             slug,
             text,
             {
                 "type": "raw-transcript",
+                "immutable": True,
                 "slug": slug,
-                "title": title or slug,
+                "title": display_title,
                 "source_uri": source_uri,
                 "source_type": source_type,
                 "captured": iso(),
             },
         )
-        run.stage("raw", path=str(raw_path))
+        source_path = _write_source_stub(
+            cfg,
+            slug,
+            title=display_title,
+            source_uri=source_uri,
+            source_type=source_type,
+        )
+        run.stage("raw", path=str(raw_path), source=str(source_path))
 
         chunks = chunk_text(text)
         state = _state(cfg, slug)

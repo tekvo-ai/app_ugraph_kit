@@ -162,8 +162,10 @@ def cmd_init(args) -> int:
 
     print()
     print("Next:")
-    print(f"  ugraph {prefix}ingest youtube <channel-url> --limit 25")
-    print(f"  ugraph {prefix}skills install     # agent instructions for the extraction pass")
+    print(f"  ugraph {prefix}            # capture clipboard / paste (no model required)")
+    print(f"  ugraph {prefix}ingest youtube <channel-or-playlist-url> --limit 10")
+    print(f"  ugraph {prefix}auth status # optional: API / Ollama for synthesize")
+    print(f"  ugraph {prefix}skills install")
     if not reachable:
         print()
         print(f"  (or `cd {cfg_path.parent.name}` and drop the --kb flag)")
@@ -529,6 +531,12 @@ def cmd_capture(args) -> int:
     print(f"Captured {result.slug}: {result.written} new, {result.skipped} skipped "
           f"({result.total_chunks} chunk(s))")
     print(f"  → {result.raw_path}")
+    print(f"  → {cfg.sources / f'{result.slug}.md'}")
+
+    from ugraph import indexes
+    changed = indexes.write_all(cfg)
+    if changed:
+        print(f"  indexes refreshed ({len(changed)} file(s))")
 
     _maybe_synthesize(cfg, result.slug)
     return 0
@@ -647,7 +655,12 @@ def _run_feed_pipeline(cfg, *, limit: int, channel: str | None,
     changed = indexes.write_all(cfg)
     if changed:
         print(f"  indexes refreshed ({len(changed)} file(s))")
-    print("Pipeline done: raw → candidates → draft concepts → indexes")
+    if result.get("aborted"):
+        print("Pipeline paused: fix billing/auth, then resume with the command above")
+    elif result["written"] == 0 and result["attempted"] and result["failed"]:
+        print("Pipeline incomplete: extract failed — pending sources were not synthesized")
+    else:
+        print("Pipeline done: raw → candidates → draft concepts → indexes")
 
 
 # ---------------------------------------------------------------------------
@@ -1142,7 +1155,10 @@ def selectors(args) -> dict:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="ugraph",
-        description="Build an agent-navigable knowledge base from a YouTube channel.",
+        description=(
+            "Build an agent-navigable knowledge base from clipboard, files, "
+            "and YouTube feeds — with verified quotes."
+        ),
     )
     p.add_argument("--version", action="version", version=f"ugraph-kit {__version__}")
     p.add_argument("--kb", metavar="PATH",
