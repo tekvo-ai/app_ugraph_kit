@@ -2,6 +2,8 @@
 .venv/
 .smoke/
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
 __pycache__/
 *.py[cod]
 
@@ -16,11 +18,10 @@ htmlcov/
 .env.*
 !.env.example
 
-# Nested site repo (saran-io/ugraph-web) + local-only
+# Nested site repo (ugraph-web) + local-only
 ugraph-web/
 .agents/
 .vscode/
 papers/
-export,
 opencode.json
 skills-lock.json

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ugraph-kit"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Build an agent-navigable, citation-verified knowledge base from sources you trust."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -32,15 +32,23 @@ dependencies = [
   "yt-dlp>=2025.1.15",
 ]
 
+[project.urls]
+Homepage = "https://ugraph.build"
+Repository = "https://github.com/tekvo-ai/app_ugraph_kit"
+Issues = "https://github.com/tekvo-ai/app_ugraph_kit/issues"
+Changelog = "https://github.com/tekvo-ai/app_ugraph_kit/blob/main/CHANGELOG.md"
+
 [project.optional-dependencies]
 api = [
   "anthropic>=0.34.0",
   "openai>=1.30.0",
 ]
 dev = [
-    "build>=1.2.2",
+  "build>=1.2.2",
+  "mypy>=1.11",
   "pytest>=8.0.0",
   "pytest-cov>=5.0.0",
+  "ruff>=0.6",
   "twine>=6.0.0",
 ]
 
@@ -50,13 +58,45 @@ ugraph = "ugraph.cli:main"
 [tool.setuptools]
 package-dir = { "" = "src" }
 
+[tool.setuptools.dynamic]
+version = { attr = "ugraph.__version__" }
+
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["ugraph*"]
 
 [tool.setuptools.package-data]
-ugraph = ["_bundled/**/*"]
+ugraph = ["_bundled/**/*", "py.typed"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q"
+addopts = "-q --cov=ugraph --cov-report=term-missing"
+
+[tool.coverage.run]
+source = ["ugraph"]
+
+[tool.coverage.report]
+# Raised as tests land. It exists to stop coverage sliding backwards, not to claim
+# the current number is good enough — cli.py (18%) and sources/youtube.py (34%) are
+# still the thin spots. A couple of points of slack absorb platform differences
+# across the CI matrix.
+fail_under = 63
+show_missing = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+extend-exclude = ["build"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+
+[tool.mypy]
+python_version = "3.10"
+files = ["src/ugraph"]
+ignore_missing_imports = true
+# Non-strict on purpose: the codebase is already ~85% annotated, so this locks in
+# what is there without blocking on the two clusters (cli.py args, verify.py config)
+# that Phase 3.2 closes.
+warn_unused_ignores = true
+warn_redundant_casts = true

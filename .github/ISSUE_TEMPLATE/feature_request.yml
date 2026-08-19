@@ -1,0 +1,26 @@
+name: Feature request
+description: Propose something ugraph should do
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do that ugraph makes hard today?
+    validations:
+      required: true
+  - type: textarea
+    id: deviation
+    attributes:
+      label: How it fits the goal
+      description: >
+        docs/PRODUCT.md §3 sets the deviation test — does this improve
+        "copy → ugraph → concepts/graph an agent can use" for someone who just
+        installed the CLI? If it does not, say which milestone it belongs to.
+    validations:
+      required: true
+  - type: input
+    id: feature-id
+    attributes:
+      label: Related feature ID
+      description: If this maps to a row in the docs/PRODUCT.md feature map (e.g. F2.4), name it.

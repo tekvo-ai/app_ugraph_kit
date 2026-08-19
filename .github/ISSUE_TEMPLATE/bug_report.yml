@@ -1,0 +1,33 @@
+name: Bug report
+description: Something ugraph did that it should not have
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What you ran
+      description: The exact command, and the input type (clipboard, pipe, file, URL).
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected, and what happened instead
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Output
+      description: >
+        Paste the error, plus `ugraph logs` if the run got far enough to record events.
+        Never paste API keys.
+      render: shell
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `ugraph --version`, plus your OS and Python version.
+    validations:
+      required: true

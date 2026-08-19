@@ -20,8 +20,9 @@ No long-lived PyPI API token is needed.
 
 ## Release
 
-1. Update the version in both `pyproject.toml` and
-   `src/ugraph/__init__.py`.
+1. Update `__version__` in `src/ugraph/__init__.py`. That is the only place
+   the version lives — `pyproject.toml` reads it via
+   `[tool.setuptools.dynamic]`, so the two can no longer drift.
 2. Run:
 
    ```bash

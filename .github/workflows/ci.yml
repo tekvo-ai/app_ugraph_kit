@@ -5,19 +5,36 @@ on:
   pull_request:
 
 jobs:
-  test:
-    name: Python ${{ matrix.python }}
+  quality:
+    name: Lint and typecheck
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        python: ["3.10", "3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
-      - run: uv venv --python ${{ matrix.python }}
-      - run: uv pip install -e ".[dev]"
-      - run: .venv/bin/python -m pytest
+      - run: uv sync --locked --extra dev
+      - run: uv run ruff check src tests
+      - run: uv run mypy
+
+  test:
+    name: Python ${{ matrix.python }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python: ["3.10", "3.11", "3.12", "3.13"]
+        include:
+          # The headline UX is clipboard capture, which reaches for `pbpaste` first.
+          # An ubuntu-only matrix never exercises the path most users actually hit.
+          - os: macos-latest
+            python: "3.12"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      # --locked fails loudly if uv.lock has drifted from pyproject.toml, so the
+      # committed lockfile is the thing CI actually installs.
+      - run: uv sync --locked --extra dev --python ${{ matrix.python }}
+      - run: uv run pytest
 
   package:
     name: Build and install wheel
