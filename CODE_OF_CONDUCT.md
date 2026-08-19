@@ -35,7 +35,7 @@ the project in public spaces.
 ## Enforcement
 
 Report abusive, harassing, or otherwise unacceptable behaviour to the maintainers at
-**<INSERT CONTACT: an email or GitHub handle the maintainers monitor>**. All complaints
+**saran@tekvo.io**. All complaints
 will be reviewed and investigated promptly and fairly, and the reporter's privacy and
 security will be respected.
 

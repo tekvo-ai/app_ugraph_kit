@@ -6,7 +6,7 @@ All notable changes to `ugraph-kit`. Format follows
 
 Product context and roadmap live in [`docs/PRODUCT.md`](docs/PRODUCT.md).
 
-## [Unreleased]
+## [0.1.0] - 2026-08-19
 
 ### Added
 - Reports now say which knowledge base they describe. `ugraph status` prints the
@@ -72,10 +72,9 @@ Product context and roadmap live in [`docs/PRODUCT.md`](docs/PRODUCT.md).
 - `runs.Run.__exit__` was annotated `-> bool`, which claims the context manager may
   swallow the exception it wraps. It always returned `False`; the annotation now says so.
 
-## [0.1.0] - unreleased
+First public release. The ingest spine — content-addressed chunks, idempotent and
+resumable re-ingest, verbatim quote gates, `lint` / `verify` / `ledger` / `graph`,
+optional local (Ollama) or API extraction, and person capture — plus everything
+above.
 
-Initial alpha: ingest spine with content-addressed chunks, idempotent and resumable
-re-ingest, verbatim quote gates, `lint` / `verify` / `ledger` / `graph`, optional
-local (Ollama) or API extraction, and person capture.
-
-[Unreleased]: https://github.com/tekvo-ai/app_ugraph_kit/compare/main...HEAD
+[0.1.0]: https://github.com/tekvo-ai/app_ugraph_kit/releases/tag/v0.1.0

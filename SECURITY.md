@@ -11,8 +11,8 @@ Please **do not** open a public issue for a security problem.
 
 Report it privately through GitHub's
 [private vulnerability reporting](https://github.com/tekvo-ai/app_ugraph_kit/security/advisories/new)
-on this repository. Include what you ran, what you observed, and the impact you think
-it has. Expect an initial response within a week.
+on this repository, or by email to **saran@tekvo.io**. Include what you ran, what you
+observed, and the impact you think it has. Expect an initial response within a week.
 
 ## What ugraph touches on your machine
 
