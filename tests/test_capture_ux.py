@@ -1,4 +1,4 @@
-from ugraph.ingest import derive_title, unique_slug, ingest_document
+from ugraph.ingest import derive_title, ingest_document, unique_slug
 from ugraph.store import read_md
 
 

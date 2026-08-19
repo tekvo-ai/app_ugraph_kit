@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from types import SimpleNamespace
 
 from ugraph import person as person_mod
 from ugraph.cli import build_parser
 from ugraph.store import read_md
-
 
 URL = "https://www.youtube.com/watch?v=kPN564Kol14&t=3768s"
 
