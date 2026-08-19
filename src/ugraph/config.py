@@ -28,7 +28,7 @@ from typing import Any
 try:  # stdlib from 3.11; the backport is a dependency below that
     import tomllib
 except ModuleNotFoundError:  # pragma: no cover
-    import tomli as tomllib  # type: ignore[no-redef]
+    import tomli as tomllib
 
 CONFIG_FILENAME = "ugraph.toml"
 
@@ -62,6 +62,21 @@ def find_config(start: Path | None = None) -> Path | None:
     return None
 
 
+def _remembered_kb() -> Path | None:
+    """The machine default set by `ugraph init` or `ugraph use`.
+
+    Imported lazily and failure-tolerant: config resolution runs on every command, so
+    a missing or unreadable settings file must degrade to "nothing remembered"
+    rather than break an unrelated one.
+    """
+    try:
+        from ugraph import auth
+
+        return auth.get_kb()
+    except Exception:
+        return None
+
+
 def _looks_like_kb(path: Path) -> bool:
     return (path / "SCHEMA.md").is_file() or (path / "concepts").is_dir()
 
@@ -75,6 +90,10 @@ class Config:
     state_dir: Path | None = None
     log_dir: Path | None = None
     raw: dict[str, Any] = field(default_factory=dict)
+    #: How `kb` was chosen, for commands that report which base they acted on. Since
+    #: a knowledge base can now come from a machine-wide default, the path alone does
+    #: not answer the question people actually ask, which is *why this one*.
+    source: str = ""
 
     # -- derived paths -----------------------------------------------------
 
@@ -177,24 +196,45 @@ def load(kb: str | Path | None = None, start: Path | None = None) -> Config:
             raise ConfigError(f"cannot parse {config_path}: {exc}") from exc
 
     root: Path | None = None
+    source = ""
     if kb:
-        root = Path(kb).expanduser()
+        root, source = Path(kb).expanduser(), "--kb flag"
     elif os.environ.get("UGRAPH_KB"):
-        root = Path(os.environ["UGRAPH_KB"]).expanduser()
+        root, source = Path(os.environ["UGRAPH_KB"]).expanduser(), "UGRAPH_KB"
     elif config_path:
         configured = data.get("kb")
         root = (Path(configured).expanduser() if configured else config_path.parent)
         if not root.is_absolute():
             root = (config_path.parent / root).resolve()
+        source = str(config_path)
     elif _looks_like_kb(Path.cwd()):
-        root = Path.cwd()
+        root, source = Path.cwd(), "current directory"
+    else:
+        # Nothing local said which knowledge base this is, so fall back to the one
+        # this machine was set up with. Ranked last on purpose: an explicit flag, an
+        # env var, a nearby ugraph.toml, or standing inside a KB all describe *this*
+        # invocation, and any of them should beat a machine-wide default.
+        remembered = _remembered_kb()
+        if remembered is not None:
+            root, source = remembered, "remembered default"
+            # Load that KB's own settings too — inheriting the taxonomy and paths of
+            # whatever directory the shell happened to be in would be worse than
+            # having no config at all.
+            config_path = find_config(remembered)
+            if config_path:
+                try:
+                    data = tomllib.loads(config_path.read_text(encoding="utf-8"))
+                except Exception as exc:
+                    raise ConfigError(
+                        f"cannot parse {config_path}: {exc}") from exc
 
     if root is None:
         raise ConfigError(
             "cannot find a knowledge base.\n"
             "  Pass --kb PATH, set UGRAPH_KB, or run inside a directory containing "
             f"{CONFIG_FILENAME}.\n"
-            "  To create one:  ugraph init ./my-kb"
+            "  To create one:      ugraph init ./my-kb\n"
+            "  To use an existing: ugraph use ./my-kb   # remembered from then on"
         )
 
     root = root.expanduser().resolve()
@@ -215,4 +255,5 @@ def load(kb: str | Path | None = None, start: Path | None = None) -> Config:
         state_dir=_opt("state_dir"),
         log_dir=_opt("log_dir"),
         raw=data,
+        source=source,
     )

@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import xml.etree.ElementTree as ET
+from collections.abc import Callable
 from typing import Any
 
 from ugraph.config import Config
@@ -81,7 +82,7 @@ def build(config: Config, include_provenance: bool = True,
 
     nodes: list[dict[str, Any]] = []
     for page in pages:
-        attrs = {"id": _node_id(config, page)}
+        attrs: dict[str, Any] = {"id": _node_id(config, page)}
         for field in NODE_FIELDS:
             value = page.meta.get(field)
             if value not in (None, "", []):
@@ -108,7 +109,7 @@ def build(config: Config, include_provenance: bool = True,
                 key = str(resolved.resolve())
                 typed_targets.setdefault(key, heading)
 
-        for text, target in get_md_links(page.body):
+        for _text, target in get_md_links(page.body):
             resolved = resolve_md_link(page.path, target)
             if resolved is None:
                 continue
@@ -128,10 +129,10 @@ def build(config: Config, include_provenance: bool = True,
                 continue
 
             dst_id = _node_id(config, dest)
-            key = (src_id, dst_id, relation)
-            if key in seen:
+            edge_key = (src_id, dst_id, relation)
+            if edge_key in seen:
                 continue  # a page may cite the same target repeatedly
-            seen.add(key)
+            seen.add(edge_key)
             edges.append({"source": src_id, "target": dst_id, "relation": relation})
 
     return {
@@ -301,8 +302,10 @@ def layout(graph: dict[str, Any], iterations: int = 420,
                 d = math.sqrt(d2)
                 f = (90000.0 * alpha) / d2
                 fx, fy = (dx / d) * f, (dy / d) * f
-                vel[i][0] -= fx; vel[i][1] -= fy
-                vel[j][0] += fx; vel[j][1] += fy
+                vel[i][0] -= fx
+                vel[i][1] -= fy
+                vel[j][0] += fx
+                vel[j][1] += fy
 
         for a, b, rel in links:
             dx = pos[b][0] - pos[a][0]
@@ -311,14 +314,18 @@ def layout(graph: dict[str, Any], iterations: int = 420,
             rest = 620.0 if rel == RELATION_UNTYPED else 420.0
             f = (d - rest) * 0.012 * alpha
             fx, fy = (dx / d) * f, (dy / d) * f
-            vel[a][0] += fx; vel[a][1] += fy
-            vel[b][0] -= fx; vel[b][1] -= fy
+            vel[a][0] += fx
+            vel[a][1] += fy
+            vel[b][0] -= fx
+            vel[b][1] -= fy
 
         for i in range(len(ids)):
             vel[i][0] -= pos[i][0] * 0.0016 * alpha
             vel[i][1] -= pos[i][1] * 0.0016 * alpha
-            vel[i][0] *= 0.84; vel[i][1] *= 0.84
-            pos[i][0] += vel[i][0]; pos[i][1] += vel[i][1]
+            vel[i][0] *= 0.84
+            vel[i][1] *= 0.84
+            pos[i][0] += vel[i][0]
+            pos[i][1] += vel[i][1]
 
     return {nid: (round(pos[i][0]), round(pos[i][1])) for nid, i in index.items()}
 
@@ -594,7 +601,9 @@ def to_d3(graph: dict[str, Any], title: str = "Concept graph") -> str:
     }
 
 
-FORMATS = {"json": to_json, "graphml": to_graphml, "dot": to_dot}
+FORMATS: dict[str, Callable[[dict[str, Any]], str]] = {
+    "json": to_json, "graphml": to_graphml, "dot": to_dot,
+}
 
 # Formats needing more than the graph itself are dispatched separately by render().
 CONTEXT_FORMATS = {"canvas", "obsidian-groups"}

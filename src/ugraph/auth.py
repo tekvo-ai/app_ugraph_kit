@@ -28,7 +28,49 @@ SETTINGS_FILE = "settings.toml"
 PROVIDERS = ("anthropic", "openai")
 ENV_VARS = {"anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY"}
 
-DEFAULT_MODELS = {"anthropic": "claude-sonnet-4-5", "openai": "gpt-4o-mini"}
+#: Fallback model per provider, used only when neither `ugraph auth use --model` nor
+#: `[extract].model` names one. A default, not a pin: every call site takes the model
+#: as a parameter, so upgrading is a config change, never a code change.
+DEFAULT_MODELS = {"anthropic": "claude-opus-5", "openai": "gpt-4o-mini"}
+
+
+#: How an API model announces its provider. Prefix match, longest first so a more
+#: specific prefix wins. This is deliberately not an allowlist of known models — it
+#: only answers "who serves this?", so a model released tomorrow routes correctly
+#: without a code change. Anything unrecognised is not an error: it routes to the
+#: local backend, which is the one that can serve an arbitrary name.
+MODEL_PREFIXES: tuple[tuple[str, str], ...] = (
+    ("claude-", "anthropic"),
+    ("gpt-", "openai"),
+    ("chatgpt-", "openai"),
+    ("text-embedding-", "openai"),
+    ("o1", "openai"),
+    ("o3", "openai"),
+    ("o4", "openai"),
+)
+
+
+def provider_for_model(model: str | None) -> str | None:
+    """Which API provider serves this model ID, or None if no API provider does.
+
+    None means "not an API model as far as we can tell" — the caller should treat it
+    as local rather than guessing a provider, because sending a model to the wrong
+    API is a confusing failure that looks like a bad key.
+    """
+    name = str(model or "").strip().lower()
+    if not name:
+        return None
+    for prefix, provider in sorted(MODEL_PREFIXES, key=lambda p: -len(p[0])):
+        if name.startswith(prefix):
+            return provider
+    return None
+
+
+def backend_for_model(model: str | None) -> str | None:
+    """The backend that should run this model: `api`, `ollama`, or None if unnamed."""
+    if not str(model or "").strip():
+        return None
+    return "api" if provider_for_model(model) else "ollama"
 
 
 def config_dir() -> Path:
@@ -108,14 +150,45 @@ def get_backend() -> dict[str, str]:
     return out
 
 
+def set_kb(path: str | Path) -> Path:
+    """Remember this knowledge base as the machine default for future sessions."""
+    settings = _path(SETTINGS_FILE)
+    data = _read(settings)
+    data["kb"] = str(Path(path).expanduser().resolve())
+    _write(settings, data)
+    return settings
+
+
+def get_kb() -> Path | None:
+    """The remembered knowledge base, if one is set and still on disk.
+
+    A remembered path that has since been deleted or moved is treated as unset: it
+    should never be the reason a command fails somewhere unrelated.
+    """
+    value = _read(_path(SETTINGS_FILE)).get("kb")
+    if not value:
+        return None
+    path = Path(str(value)).expanduser()
+    return path if path.is_dir() else None
+
+
+def forget_kb() -> None:
+    settings = _path(SETTINGS_FILE)
+    data = _read(settings)
+    if data.pop("kb", None) is not None:
+        _write(settings, data)
+
+
 def default_model(provider: str) -> str:
     return DEFAULT_MODELS.get(provider, "")
 
 
 def status() -> dict[str, Any]:
     """Everything `ugraph auth status` prints, as data."""
+    kb = get_kb()
     return {
         "config_dir": str(config_dir()),
         "keys": {p: key_source(p) for p in PROVIDERS},
         "backend": get_backend(),
+        "kb": str(kb) if kb else None,
     }

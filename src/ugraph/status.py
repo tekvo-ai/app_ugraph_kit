@@ -105,6 +105,12 @@ def collect(config: Config, newest: int | None = None, since: date | None = None
     of its own, so filtering it by one would be inventing an answer. `scope` records
     what was applied so neither a reader nor a UI has to guess.
     """
+    # Which base these numbers describe. A knowledge base can be resolved from a
+    # machine-wide default now, so a report that shows only numbers leaves the reader
+    # unable to tell whether they are looking at the base they meant.
+    kb_path = str(config.kb)
+    kb_source = config.source
+
     sources = _load_sources(config)
     if newest is not None or since is not None or channel is not None:
         sources = select.by_recency(sources, newest=newest, since=since,
@@ -142,7 +148,7 @@ def collect(config: Config, newest: int | None = None, since: date | None = None
         bucket["talks"] += 1
         bucket["candidates"] += len(candidate.get("concepts") or [])
 
-    pending_rows = [
+    pending_rows: list[dict[str, Any]] = [
         {
             "title": s.title,
             "size": _raw_size(s),
@@ -165,6 +171,8 @@ def collect(config: Config, newest: int | None = None, since: date | None = None
     scoped_candidates = sum(1 for s in sources if s.path.stem in candidates)
 
     return {
+        "kb": kb_path,
+        "kb_source": kb_source,
         "scope": select.describe(newest=newest, since=since, channel=channel),
         "sources_total": len(sources),
         "extracted": len(extracted),
@@ -211,6 +219,15 @@ def render(
 
     out.append("Knowledge Base Status")
     out.append("=" * 58)
+    # Which base, and why this one. The second question is the one that bites: a
+    # remembered default looks identical to a deliberate choice until it is named.
+    if stats.get("kb"):
+        out.append(f"  {stats['kb']}")
+        if stats.get("kb_source"):
+            hint = ("  ·  change with `ugraph use PATH`"
+                    if stats["kb_source"] == "remembered default" else "")
+            out.append(f"  via {stats['kb_source']}{hint}")
+        out.append("")
     # Say which subset the source numbers describe. A filtered "12/30" that looks
     # exactly like an unfiltered one is how people misread their own progress.
     if stats.get("scope"):

@@ -38,7 +38,7 @@ def ask(prompt: str, default: str = "") -> str:
         answer = input(f"  {prompt}{suffix}: ").strip()
     except (EOFError, KeyboardInterrupt):
         print()
-        raise SystemExit(130)
+        raise SystemExit(130) from None
     return answer or default
 
 
@@ -68,6 +68,17 @@ def find_vault(start: Path) -> Path | None:
     return None
 
 
+def is_feed_url(value: str) -> bool:
+    """Whether this input is a YouTube feed, and so has a video count to cap.
+
+    Imported lazily: `ugraph init` should not pay for the source adapter just to
+    classify one answer, and wizard.py is otherwise free of ugraph imports.
+    """
+    from ugraph.sources.youtube import is_feed_url as _is_feed_url
+
+    return _is_feed_url(value.strip())
+
+
 def run(cwd: Path | None = None) -> dict:
     """Ask the questions and return the answers. Writes nothing itself."""
     cwd = (cwd or Path.cwd()).resolve()
@@ -93,17 +104,21 @@ def run(cwd: Path | None = None) -> dict:
         answers["kb"] = base / "knowledge"
 
     # 2. Something to ingest. Optional; an empty KB is a valid starting point.
+    #    The daily loop is "copy anything, type ugraph", so this must not privilege
+    #    one source type — a file on disk is at least as likely as a channel URL.
     print()
-    channel = ask("YouTube channel to ingest (blank to skip)", "")
-    answers["channel"] = channel or None
-    if channel:
+    source = ask("Something to ingest now? (file path or URL — blank to skip)", "")
+    answers["source"] = source or None
+    if source and is_feed_url(source):
+        # Only a feed has a countable backlog worth capping. Asking "how many" about
+        # a single file would be a question with no meaningful answer.
         raw = ask("How many videos to start with", "25")
         answers["limit"] = int(raw) if raw.isdigit() else 25
 
     # 3. The part people do not expect: ugraph runs no model. Say so here rather than
     #    letting them discover it at step four.
     print()
-    print("  Turning transcripts into linked concepts needs a model.")
+    print("  Turning what you capture into linked concepts needs a model.")
     print("  ugraph itself never calls one — you choose what does.")
     answers["backend"] = ask_choice("Which?", BACKENDS, default=1)
 
@@ -113,18 +128,24 @@ def run(cwd: Path | None = None) -> dict:
 def summary(answers: dict, config_path: Path) -> str:
     kb = answers["kb"]
     lines = ["", f"  Knowledge base   {kb}", f"  Config           {config_path}"]
-    if answers.get("channel"):
-        lines.append(f"  Ingested from    {answers['channel']}")
+    if answers.get("source"):
+        lines.append(f"  Ingested from    {answers['source']}")
     lines += ["", "  Next:"]
 
     backend = answers.get("backend")
-    if not answers.get("channel"):
-        # Repeat the URL they already gave rather than a placeholder — this branch is
-        # also where a failed ingest lands, and retyping the channel is friction at
-        # exactly the moment something already went wrong.
-        url = answers.get("retry_channel") or "<channel-url>"
-        lines.append(f"    ugraph ingest youtube {url} "
-                     f"--limit {answers.get('limit', 25)}")
+    # The daily loop is the product: copy anything, type `ugraph`, confirm. Lead with
+    # it. A source-specific command is an option below it, never the headline.
+    lines.append("    ugraph                    # capture clipboard / paste / pipe")
+    if not answers.get("source"):
+        retry = answers.get("retry_command")
+        if retry:
+            # Repeat the command for the input they already named rather than a
+            # placeholder — this branch is where a failed ingest lands, and retyping
+            # it is friction at exactly the moment something already went wrong.
+            lines.append(f"    {retry}")
+        else:
+            lines += ["    ugraph ingest file ./notes.md",
+                      "    ugraph ingest youtube <channel-or-playlist-url> --limit 10"]
     if backend == "claude-code":
         lines += ["    ugraph skills install",
                   "    then in Claude Code:  /channel-to-kb"]
@@ -154,7 +175,7 @@ def toml_for(answers: dict, config_path: Path) -> str:
         kb_value = str(kb)
 
     lines = [
-        "# ugraph configuration — https://github.com/saran-io/ugraph",
+        "# ugraph configuration — https://github.com/tekvo-ai/app_ugraph_kit",
         "",
         f'kb = "{kb_value}"',
     ]

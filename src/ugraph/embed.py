@@ -21,9 +21,10 @@ import math
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterable, Protocol
+from typing import Any, Protocol
 
 from ugraph import ingest
 from ugraph.config import Config
@@ -284,7 +285,7 @@ def embed_document(
         vector = encoder.embed_one(text)
         if not dim:
             dim = len(vector)
-            encoder.dim = dim  # type: ignore[misc]
+            encoder.dim = dim
         key = encode_hash(text, dim=dim)
         new_rows[cid] = {
             "hash": key,

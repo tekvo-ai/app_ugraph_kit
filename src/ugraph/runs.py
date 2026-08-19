@@ -28,9 +28,10 @@ import json
 import os
 import time
 import uuid
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Literal
 
 from ugraph.config import Config
 
@@ -83,7 +84,7 @@ class Run:
     def elapsed_ms(self) -> int:
         return int((time.monotonic() - self._start) * 1000)
 
-    def __enter__(self) -> "Run":
+    def __enter__(self) -> Run:
         # pid lets readers tell a live run from a killed one: a run whose process
         # is gone but that never emitted done/fail is stale, not active.
         emit(self.config, self.module, "start", run=self.id, slug=self.slug,
@@ -103,7 +104,7 @@ class Run:
         emit(self.config, self.module, "fail", run=self.id, slug=self.slug,
              elapsed_ms=self.elapsed_ms, error=error, **self.meta, **fields)
 
-    def __exit__(self, exc_type, exc, _tb) -> bool:
+    def __exit__(self, exc_type, exc, _tb) -> Literal[False]:
         if self._finished:
             return False
         if exc is None:

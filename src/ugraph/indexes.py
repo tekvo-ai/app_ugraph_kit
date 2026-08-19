@@ -197,8 +197,8 @@ def build_root_index(config: Config, tax: dict) -> tuple[Path, str]:
     """The KB entry point — what an agent reads first."""
     index_path = config.kb / "index.md"
 
-    counts = defaultdict(int)
-    domains = defaultdict(int)
+    counts: defaultdict[str, int] = defaultdict(int)
+    domains: defaultdict[str, int] = defaultdict(int)
     for page in iter_pages(config):
         counts[page.type] += 1
         if page.type == "concept" and page.domain:
@@ -237,7 +237,8 @@ def build_root_index(config: Config, tax: dict) -> tuple[Path, str]:
         "",
         "1. Read [SCHEMA.md](SCHEMA.md) to understand page types and typed relationships.",
         "2. Scan the directory index that matches your question:",
-        "   [Concepts](concepts/index.md) · [Entities](entities/index.md) · [Sources](sources/index.md)",
+        "   [Concepts](concepts/index.md) · [Entities](entities/index.md) · "
+        "[Sources](sources/index.md)",
         "3. Open only the pages you need. Follow `## Prerequisites`, `## Builds on`,",
         "   `## Related` to traverse.",
         "4. Cite claims back to a source page and timestamp: `(source @ 00:14:32)`.",
@@ -258,7 +259,8 @@ def build_root_index(config: Config, tax: dict) -> tuple[Path, str]:
         lines += [
             "## Curated maps",
             "",
-            "Hand-written narrative overviews. Opinionated where the generated indexes are neutral.",
+            "Hand-written narrative overviews. Opinionated where the generated "
+            "indexes are neutral.",
             "",
             *moc_lines,
             "",

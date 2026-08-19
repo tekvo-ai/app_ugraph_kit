@@ -32,6 +32,7 @@ import time
 from collections.abc import Callable, Iterable
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import cast
 
 from ugraph.config import Config
 from ugraph.store import State, hhmmss, iso, log, read_md, slugify, write_md
@@ -97,9 +98,7 @@ def is_feed_url(value: str) -> bool:
     query = parse_qs(parsed.query)
     if "list" in query or path.endswith("/playlist"):
         return True
-    if path.endswith(("/videos", "/streams", "/releases")):
-        return True
-    return False
+    return path.endswith(("/videos", "/streams", "/releases"))
 
 
 def channel_state_key(channel_url: str) -> str:
@@ -127,7 +126,8 @@ def _listing_url(channel_url: str) -> str:
     """
     from urllib.parse import parse_qs, urlparse
 
-    url = channel_state_key(channel_url) if "list=" in channel_url else channel_url.strip().rstrip("/")
+    url = (channel_state_key(channel_url) if "list=" in channel_url
+           else channel_url.strip().rstrip("/"))
     parsed = urlparse(url)
     path = parsed.path.rstrip("/")
     query = parse_qs(parsed.query)
@@ -636,7 +636,7 @@ def ingest(config: Config,
         "dry_run": dry_run,
     }
 
-    warnings: list[str] = result["warnings"]
+    warnings: list[str] = cast("list[str]", result["warnings"])
     written = skipped = 0
 
     def _save() -> None:

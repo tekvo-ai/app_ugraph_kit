@@ -34,6 +34,8 @@ Backends:
 
 from __future__ import annotations
 
+import contextlib
+import inspect
 import json
 import os
 import re
@@ -106,6 +108,34 @@ def context_for(system: str, user: str) -> int:
     while size < needed and size < MAX_CONTEXT:
         size *= 2
     return min(size, MAX_CONTEXT)
+
+
+def auth_provider_for(model):
+    """`auth.provider_for_model`, imported here so `check()` stays lazy."""
+    from ugraph import auth
+
+    return auth.provider_for_model(model)
+
+
+def _as_int(value):
+    """A positive int from a config value, or None. Never raises on bad input."""
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def _as_float(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_str(value):
+    text = str(value).strip() if value is not None else ""
+    return text or None
 
 
 class BackendError(RuntimeError):
@@ -206,15 +236,24 @@ class ApiBackend(Backend):
     (written by `ugraph auth set`). The key is passed to the client explicitly rather
     than relying on the SDK's env lookup, so a keys-file user and an env user get
     identical behavior.
+
+    Token budgets are never hardcoded here. Anthropic requires an output ceiling, so
+    one is resolved per request through `ugraph.limits` — operator config, then the
+    provider's own model metadata, then a budget derived from the prompt. OpenAI does
+    not require one, so the parameter is omitted and the provider applies the model's
+    own maximum. Either way, changing `model` needs no change here.
     """
 
     name = "api"
 
-    def __init__(self, model: str | None = None):
+    def __init__(self, model: str | None = None, config: Config | None = None):
         from ugraph import auth
 
-        # `ugraph auth use openai` pins a provider; otherwise first key wins.
-        preferred = auth.get_backend().get("provider")
+        # The model decides the provider when it names one. Without this, a pinned
+        # provider would send `gpt-4o` to Anthropic, which fails as an auth-looking
+        # error and sends the user hunting for the wrong problem.
+        routed = auth.provider_for_model(model)
+        preferred = routed or auth.get_backend().get("provider")
         order = ([preferred] + [p for p in auth.PROVIDERS if p != preferred]
                  if preferred else list(auth.PROVIDERS))
 
@@ -225,13 +264,54 @@ class ApiBackend(Backend):
             if key:
                 self.provider, self.api_key = candidate, key
                 break
+
+        # A routed provider is not a preference, it is a requirement: falling back to
+        # the other provider's key would silently run a different model than asked.
+        if routed and self.provider != routed:
+            self.provider, self.api_key = routed, None
+
         self.model = model or auth.default_model(self.provider)
 
+        # Everything below is operator-tunable in ugraph.toml under [extract]. Each
+        # one stays None unless set, so an unset knob means "provider default"
+        # rather than a value this file invented.
+        settings = (config.raw.get("extract", {}) if config else {})
+        self.config_dir = auth.config_dir()
+        self.max_tokens: int | None = _as_int(settings.get("max_tokens"))
+        self.thinking: str | None = _as_str(settings.get("thinking"))
+        self.effort: str | None = _as_str(settings.get("effort"))
+        self.temperature: float | None = _as_float(settings.get("temperature"))
+
+    def _client(self) -> Any:
+        if self.provider == "anthropic":
+            import anthropic
+
+            return anthropic.Anthropic(api_key=self.api_key)
+        import openai
+
+        return openai.OpenAI(api_key=self.api_key)
+
+    def output_budget(self, system: str, user: str, client: Any) -> int:
+        """The `max_tokens` to request. Discovered or derived, never a literal."""
+        from ugraph import limits as limits_mod
+
+        found = limits_mod.resolve(
+            self.provider, self.model,
+            config_dir=self.config_dir, client=client, configured=self.max_tokens,
+        )
+        if found.max_output_tokens:
+            return found.max_output_tokens
+        return limits_mod.derive_output_budget(
+            system, user, ceiling=found.max_input_tokens)
+
     def check(self) -> None:
-        if not self.provider:
+        if not self.api_key:
+            wanted = self.provider or "anthropic` or `openai"
+            because = (f" — {self.model} is served by {self.provider}"
+                       if self.provider and auth_provider_for(self.model) else "")
             raise BackendError(
-                "no API key found.\n"
-                "  Run `ugraph auth set anthropic` or `ugraph auth set openai`,\n"
+                f"no {self.provider or 'API'} key found{because}.\n"
+                f"  Run `ugraph auth set {wanted}`,\n"
                 "  or use `--backend ollama` to run locally."
             )
         try:
@@ -243,34 +323,81 @@ class ApiBackend(Backend):
             ) from exc
 
     def complete(self, system: str, user: str) -> str:
+        client = self._client()
         if self.provider == "anthropic":
-            import anthropic
-            client = anthropic.Anthropic(api_key=self.api_key)
-            msg = client.messages.create(
-                model=self.model, max_tokens=8000, system=system,
-                messages=[{"role": "user", "content": user}],
-            )
-            return "".join(b.text for b in msg.content if b.type == "text")
+            return self._complete_anthropic(client, system, user)
+        return self._complete_openai(client, system, user)
 
-        import openai
-        client = openai.OpenAI(api_key=self.api_key)
-        msg = client.chat.completions.create(
-            model=self.model, temperature=0.1,
-            messages=[{"role": "system", "content": system},
-                      {"role": "user", "content": user}],
-        )
-        return msg.choices[0].message.content or ""
+    def _complete_anthropic(self, client: Any, system: str, user: str) -> str:
+        """Stream, always.
+
+        Streaming is what lets the budget be generous: the SDK refuses a
+        non-streaming request whose ceiling is large enough to risk an HTTP timeout,
+        which is exactly the ceiling a current model reports. Billing is on tokens
+        produced, not on the ceiling requested, so asking for the model's real limit
+        costs nothing and removes truncation as a failure mode.
+        """
+        request: dict[str, Any] = {
+            "model": self.model,
+            "max_tokens": self.output_budget(system, user, client),
+            "system": system,
+            "messages": [{"role": "user", "content": user}],
+        }
+        # Passed through only when configured. On models where thinking is on by
+        # default it draws on the same budget as the answer, which is the other
+        # reason the ceiling above is discovered rather than fixed.
+        if self.thinking:
+            request["thinking"] = {"type": self.thinking}
+        if self.effort:
+            request["output_config"] = {"effort": self.effort}
+        if self.temperature is not None:
+            request["temperature"] = self.temperature
+
+        with client.messages.stream(**request) as stream:
+            message = stream.get_final_message()
+        return "".join(b.text for b in message.content if b.type == "text")
+
+    def _complete_openai(self, client: Any, system: str, user: str) -> str:
+        request: dict[str, Any] = {
+            "model": self.model,
+            "messages": [{"role": "system", "content": system},
+                         {"role": "user", "content": user}],
+        }
+        # Omitted unless the operator set one: absent, the API applies the model's
+        # own maximum, which is a better answer than any number this file could pick.
+        if self.max_tokens:
+            request["max_completion_tokens"] = self.max_tokens
+        if self.temperature is not None:
+            request["temperature"] = self.temperature
+
+        message = client.chat.completions.create(**request)
+        return message.choices[0].message.content or ""
 
 
 BACKENDS = {"ollama": OllamaBackend, "api": ApiBackend}
 
 
-def make_backend(name: str, model: str | None = None) -> Backend:
+def make_backend(name: str, model: str | None = None,
+                 config: Config | None = None) -> Backend:
+    """Build and check one backend.
+
+    `config` is threaded through so a backend can read its own `[extract]` settings
+    (token ceilings, thinking, effort) instead of carrying defaults in code. It stays
+    optional: a caller that has no Config still gets a working backend on provider
+    defaults.
+    """
     if name not in BACKENDS:
         known = ", ".join(sorted(BACKENDS) + ["claude-code"])
         raise BackendError(f"unknown backend {name!r}; expected one of {known}")
     cls = BACKENDS[name]
-    backend = cls(model) if model else cls()
+    kwargs: dict[str, Any] = {}
+    if model:
+        kwargs["model"] = model
+    # Only ApiBackend reads config today; passing it to a backend that does not
+    # accept it would be a TypeError, so ask rather than assume.
+    if config is not None and "config" in inspect.signature(cls).parameters:
+        kwargs["config"] = config
+    backend = cls(**kwargs)
     backend.check()
     return backend
 
@@ -285,9 +412,17 @@ def resolve_backend(config: Config, requested: str | None = None,
     """
     from ugraph import auth
 
+    model = model or config.raw.get("extract", {}).get("model") \
+        or auth.get_backend().get("model")
     name = requested or config.raw.get("extract", {}).get("backend") \
         or auth.get_backend().get("backend") or ""
-    model = model or auth.get_backend().get("model")
+
+    if not name:
+        # A model ID names its own backend. This is what lets `--model <anything>`
+        # work with no other configuration: `claude-*`/`gpt-*` route to the API,
+        # everything else is a local model, and a model released tomorrow needs no
+        # code change to be routable.
+        name = auth.backend_for_model(model) or ""
 
     if not name:
         if any(auth.get_key(p) for p in auth.PROVIDERS):
@@ -301,7 +436,7 @@ def resolve_backend(config: Config, requested: str | None = None,
     if name == "claude-code":
         return None  # guidance-only backend: no programmatic run
     try:
-        return make_backend(name, model)
+        return make_backend(name, model, config=config)
     except BackendError:
         return None
 
@@ -530,11 +665,10 @@ def extract_one(config: Config, page: Page, backend: Backend,
             promote_mod.mark_source_extracted(config, slug)
         except Exception:
             pass
-        try:
+        # bookkeeping must not fail a successful extraction
+        with contextlib.suppress(Exception):
             ledger.record(config, slug, "extracted", by=f"ugraph extract ({backend.name})",
                           detail=f"{len(kept)} concepts, {len(rejected)} rejected")
-        except Exception:  # bookkeeping must not fail a successful extraction
-            pass
         return result
 
     result.error = result.error or "failed the verbatim gate on every attempt"
@@ -780,10 +914,9 @@ def extract_document(config: Config, slug: str, backend: Backend) -> ExtractResu
 
         result.written = True
         result.concepts = len(kept)
-        try:
+        # bookkeeping must not fail a successful extraction
+        with contextlib.suppress(Exception):
             ledger_mod.record(config, slug, "extracted",
                               by=f"ugraph capture ({backend.name})",
                               detail=f"{len(kept)} concepts, {len(rejected)} rejected")
-        except Exception:
-            pass
         return result

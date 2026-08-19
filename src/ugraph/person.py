@@ -20,7 +20,6 @@ from ugraph.config import Config
 from ugraph.sources.youtube import YT_DLP, _require_yt_dlp
 from ugraph.store import read_md, slugify, write_md
 
-
 YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"}
 
 

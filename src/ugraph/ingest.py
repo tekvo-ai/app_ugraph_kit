@@ -20,10 +20,11 @@ from __future__ import annotations
 
 import hashlib
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 from ugraph import runs
 from ugraph.config import Config
@@ -67,7 +68,7 @@ def content_id(text: str, doc_slug: str) -> str:
     collision."""
     h = hashlib.sha256()
     h.update(text.encode("utf-8"))
-    h.update("|".encode("utf-8"))
+    h.update(b"|")
     h.update(doc_slug.encode("utf-8"))
     return h.hexdigest()[:16]
 

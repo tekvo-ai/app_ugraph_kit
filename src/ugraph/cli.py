@@ -133,16 +133,23 @@ def cmd_init(args) -> int:
     cfg = config_mod.load(kb=root)
     indexes.write_all(cfg)
 
+    # This is the moment the machine has a knowledge base, so record it. Every later
+    # session then finds it with no flag, no env var, and no particular cwd.
+    from ugraph import auth as auth_mod
+    auth_mod.set_kb(root)
+
     print(f"Initialized knowledge base at {root}")
     print(f"  wrote SCHEMA.md, taxonomy.json, {len(config_mod.CONTENT_DIRS)} directories")
     print(f"  wrote {cfg_path}")
+    print("  remembered as this machine's knowledge base "
+          "(change it with `ugraph use PATH`)")
 
     # The wizard asked which model backend and whether to ingest a channel. Answering
     # those and then printing the same generic block as a bare `init` wastes the only
     # thing the questions were for — somebody who picked Ollama needs to hear about
     # `ollama pull`, not about skills install.
     if answers:
-        if answers.get("channel"):
+        if answers.get("source"):
             _ingest_from_init(cfg, answers)
         from ugraph import wizard
         print(wizard.summary(answers, cfg_path))
@@ -163,6 +170,7 @@ def cmd_init(args) -> int:
     print()
     print("Next:")
     print(f"  ugraph {prefix}            # capture clipboard / paste (no model required)")
+    print(f"  ugraph {prefix}ingest file ./notes.md")
     print(f"  ugraph {prefix}ingest youtube <channel-or-playlist-url> --limit 10")
     print(f"  ugraph {prefix}auth status # optional: API / Ollama for synthesize")
     print(f"  ugraph {prefix}skills install")
@@ -172,37 +180,130 @@ def cmd_init(args) -> int:
     return 0
 
 
-def _ingest_from_init(cfg, answers: dict) -> None:
-    """Fetch the channel the wizard asked about, if the user named one.
+def cmd_use(args) -> int:
+    """Point this machine at an existing knowledge base, for good."""
+    from ugraph import auth as auth_mod
 
-    Asking "which channel to ingest" and then only printing a command to type is a
-    question that did nothing. But this must never abort a successful scaffold: a
-    missing yt-dlp or a dead network leaves a perfectly good empty KB, so failures
-    here degrade to the command the user can run later.
+    if not args.path:
+        # Two different questions, and confusing them is the whole problem: what
+        # would a command use right now, and what is remembered for next time? They
+        # differ whenever UGRAPH_KB or a nearby ugraph.toml is in play, and reporting
+        # only the remembered one makes `use` look like it did not take effect.
+        remembered = auth_mod.get_kb()
+        try:
+            in_effect = config_mod.load()
+        except config_mod.ConfigError:
+            in_effect = None
+
+        if in_effect is not None:
+            print(f"In effect:   {in_effect.kb}")
+            print(f"             via {in_effect.source}")
+        if remembered is None:
+            print("Remembered:  none — set one with `ugraph use PATH`")
+            return 0 if in_effect is not None else 1
+        print(f"Remembered:  {remembered}")
+        if in_effect is not None and in_effect.kb != remembered:
+            print()
+            print("  These differ: something more specific is overriding the "
+                  "remembered default.")
+        return 0
+
+    root = Path(args.path).expanduser().resolve()
+    if not root.is_dir():
+        sys.exit(f"ugraph: {root} does not exist.\n"
+                 f"  To create it:  ugraph init {args.path}")
+    if not config_mod._looks_like_kb(root):
+        sys.exit(f"ugraph: {root} is not a knowledge base "
+                 "(no SCHEMA.md, no concepts/).\n"
+                 f"  To scaffold one there:  ugraph init {args.path}")
+
+    auth_mod.set_kb(root)
+    print(f"Using {root}")
+    print("  Remembered for every session on this machine.")
+    return 0
+
+
+def _ingest_from_init(cfg, answers: dict) -> None:
+    """Ingest whatever the wizard asked about, if the user named something.
+
+    Asking "anything to ingest" and then only printing a command to type is a question
+    that did nothing. But this must never abort a successful scaffold: a missing
+    yt-dlp, a dead network, or a mistyped path leaves a perfectly good empty KB, so
+    every failure degrades to the command the user can run later.
+
+    The wizard no longer assumes a YouTube channel, so this dispatches on what the
+    input actually is — a feed URL has a video backlog to cap, a path does not.
     """
+    from ugraph import person as person_mod
     from ugraph.sources import youtube
 
-    url, limit = answers["channel"], answers.get("limit", 25)
-    print(f"\nFetching up to {limit} transcripts from {url} …")
+    source = answers["source"]
+    limit = answers.get("limit", 25)
 
-    def progress(i, total, vid, title):
-        print(f"  [{i}/{total}] {title[:58]}")
+    # Same three-way split the daily loop uses (see capture_intent.classify): a feed
+    # has a backlog to cap, a person URL resolves to an entity page, everything else
+    # is a path on disk. Without this a perfectly reasonable answer — an @handle, or a
+    # mistyped path — reached ingest_path and surfaced a raw OSError.
+    is_feed = youtube.is_feed_url(source)
+    is_person = not is_feed and person_mod.is_supported_url(source)
+    if is_feed:
+        retry_command = f"ugraph ingest youtube {source} --limit {limit}"
+    elif is_person:
+        retry_command = f"ugraph person {source}"
+    else:
+        retry_command = f"ugraph ingest file {source}"
 
+    def degrade(message: str) -> None:
+        # A failed ingest must not read as a failed init. Clearing the source is what
+        # makes the summary offer the retry command instead of claiming success.
+        answers["source"] = None
+        answers["retry_command"] = retry_command
+        print(f"  {message}")
+        print("  The knowledge base is fine — run the command below when ready.")
+
+    if is_person:
+        print(f"\nResolving {source} …")
+        try:
+            if _add_person_flow(cfg, source, yes=True) != 0:
+                degrade("could not resolve that person.")
+        except Exception as exc:
+            degrade(f"person resolution failed: {exc}")
+        return
+
+    if is_feed:
+        print(f"\nFetching up to {limit} transcripts from {source} …")
+
+        def progress(i, total, vid, title):
+            print(f"  [{i}/{total}] {title[:58]}")
+
+        try:
+            feed_result = youtube.ingest(cfg, source, limit=limit, progress=progress)
+        except FileNotFoundError:
+            degrade("yt-dlp is not installed — skipping for now. "
+                    "Install it (e.g. brew install yt-dlp).")
+            return
+        except Exception as exc:
+            degrade(f"ingest failed: {exc}")
+            return
+        print(f"  ingested {feed_result['written']}, skipped {feed_result['skipped']}")
+        return
+
+    from ugraph import ingest as ingest_mod
+
+    if not Path(source).expanduser().exists():
+        # "no such file" is the likeliest answer to a prompt that accepts both a path
+        # and a URL. Say which one we took it for rather than leaking an OSError.
+        degrade(f"no file at {source} — and it is not a URL ugraph recognises.")
+        return
+
+    print(f"\nIngesting {source} …")
     try:
-        result = youtube.ingest(cfg, url, limit=limit, progress=progress)
-    except FileNotFoundError:
-        answers["retry_channel"] = answers["channel"]
-        answers["channel"] = None  # so the summary prints the ingest command again
-        print("  yt-dlp is not installed — skipping for now.")
-        print("  Install it (brew install yt-dlp) and run the ingest command below.")
+        doc_result = ingest_mod.ingest_path(cfg, source)
+    except (OSError, ingest_mod.IngestError) as exc:
+        degrade(f"ingest failed: {exc}")
         return
-    except Exception as exc:
-        answers["channel"] = None
-        print(f"  ingest failed: {exc}")
-        print("  The knowledge base is fine — run the ingest command below when ready.")
-        return
-
-    print(f"  ingested {result['written']}, skipped {result['skipped']}")
+    print(f"  ingested {doc_result.slug}: {doc_result.written} new, "
+          f"{doc_result.skipped} skipped ({doc_result.total_chunks} chunk(s) total)")
 
 
 # ---------------------------------------------------------------------------
@@ -214,10 +315,10 @@ def cmd_ingest(args) -> int:
     if args.source == "file":
         from ugraph import ingest as ingest_mod
 
-        result = ingest_mod.ingest_path(cfg, args.url)
-        print(f"Ingested {result.slug}: {result.written} new, "
-              f"{result.skipped} skipped, {result.removed} removed "
-              f"({result.total_chunks} chunk(s) total)")
+        doc_result = ingest_mod.ingest_path(cfg, args.url)
+        print(f"Ingested {doc_result.slug}: {doc_result.written} new, "
+              f"{doc_result.skipped} skipped, {doc_result.removed} removed "
+              f"({doc_result.total_chunks} chunk(s) total)")
         return 0
 
     if args.source != "youtube":
@@ -334,6 +435,7 @@ def _add_person_flow(cfg, url: str, *, yes: bool = False,
                      name: str | None = None) -> int:
     """Resolve, preview, confirm, and write one person reference."""
     from dataclasses import replace
+
     from ugraph import person as person_mod
 
     try:
@@ -486,9 +588,8 @@ def cmd_capture(args) -> int:
         not sys.stdin.isatty() and not clipboard
         and source_note == "(from stdin)"
     )
-    if not auto:
-        if not _confirm_ingest(intent.confirm_prompt, yes=False):
-            return 0 if sys.stdin.isatty() else 1
+    if not auto and not _confirm_ingest(intent.confirm_prompt, yes=False):
+        return 0 if sys.stdin.isatty() else 1
 
     if intent.kind in {"youtube_playlist", "youtube_feed"}:
         print(f"({intent.label} — running ingest → synthesize → concepts)")
@@ -703,6 +804,7 @@ def cmd_auth(args) -> int:
     st = auth_mod.status()
     print("ugraph auth status")
     print(f"  config dir: {st['config_dir']}")
+    print(f"  knowledge base: {st['kb'] or 'not set — run `ugraph use PATH`'}")
     for provider, source in st["keys"].items():
         print(f"  {provider:10} key: {source or 'not set'}")
     backend = st["backend"].get("backend")
@@ -1039,7 +1141,7 @@ def cmd_extract(args) -> int:
         return 0
 
     try:
-        backend = extract_mod.make_backend(backend_name, model)
+        backend = extract_mod.make_backend(backend_name, model, config=cfg)
     except extract_mod.BackendError as exc:
         sys.exit(f"ugraph: {exc}")
 
@@ -1228,7 +1330,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser(
         "person",
-        help="resolve a person from a YouTube link and add them to the KB",
+        help="resolve a person from a profile or talk URL and add them to the KB",
     )
     sp.add_argument(
         "url", nargs="?",
@@ -1238,6 +1340,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--yes", "-y", action="store_true",
                     help="write without interactive confirmation")
     sp.set_defaults(func=cmd_person)
+
+    sp = sub.add_parser(
+        "use", help="point this machine at a knowledge base, remembered for good")
+    sp.add_argument("path", nargs="?",
+                    help="the knowledge base to use; omit to print the current one")
+    sp.set_defaults(func=cmd_use)
 
     sp = sub.add_parser("auth", help="configure model backends and API keys")
     sp.add_argument("action", choices=["set", "status", "use"], nargs="?", default="status")

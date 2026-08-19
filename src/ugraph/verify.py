@@ -42,6 +42,7 @@ import unicodedata
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from ugraph import store
 
@@ -186,7 +187,7 @@ def _parse_transcript(path: Path) -> tuple[_Transcript | None, str]:
     if body is None:
         return None, "cannot read transcript"
 
-    paragraphs: list[list] = []
+    paragraphs: list[list[Any]] = []
     for line in body.splitlines():
         match = _MARKER_RE.match(line)
         if match:
@@ -206,7 +207,7 @@ def _parse_transcript(path: Path) -> tuple[_Transcript | None, str]:
     stamps: list[int] = []
     by_stamp: dict[int, list[int]] = {}
     cursor = 0
-    for seconds, text in paragraphs:
+    for seconds, text in ((int(p[0]), str(p[1])) for p in paragraphs):
         norm = _normalize(text)
         if not norm:
             continue
@@ -284,7 +285,7 @@ def _divergence_detail(haystack: str, needle: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _kb_rel(config, path: object) -> str:
+def _kb_rel(config, path: str | Path) -> str:
     """KB-relative where possible. Candidates live outside the KB by design, so fall
     back to the KB's parent before giving up and printing an absolute path."""
     path = Path(path)
@@ -488,8 +489,8 @@ def _check_candidate_entry(config, entry: dict, transcript: _Transcript,
             source=source,
             timestamp=stamp,
             quote=display,
-            detail=f"quote sits in the [{store.hhmmss(actual)}] paragraph of {where} ({actual - target_s:+d}s from the cited "
-                   "timestamp)",
+            detail=f"quote sits in the [{store.hhmmss(actual)}] paragraph of {where} "
+                   f"({actual - target_s:+d}s from the cited timestamp)",
         ))
     return issues
 
@@ -822,8 +823,8 @@ def _check_citation(config, cache: _Cache, page: Path, file_rel: str,
     issues.append(QuoteIssue(
         kind="timestamp-mismatch", file=location, source=source, timestamp=stamp,
         quote=display,
-        detail=f"quote appears at [{store.hhmmss(starts_at)}] in {where} ({starts_at - target_s:+d}s from the cited "
-               "timestamp)",
+        detail=f"quote appears at [{store.hhmmss(starts_at)}] in {where} "
+               f"({starts_at - target_s:+d}s from the cited timestamp)",
     ))
     return issues
 

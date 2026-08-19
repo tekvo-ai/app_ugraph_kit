@@ -16,6 +16,7 @@ import os
 import re
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 from ugraph.config import RESERVED_NAMES, Config
 from ugraph.store import iter_md, read_md
@@ -47,7 +48,7 @@ REQUIRED_FIELDS = {
 }
 
 # Extra fields required only for a particular subtype/source_type.
-CONDITIONAL_FIELDS = {
+CONDITIONAL_FIELDS: dict[tuple[str, Any], set[str]] = {
     ("source", "video"): {"youtube_id", "url", "published", "duration", "raw"},
 }
 
