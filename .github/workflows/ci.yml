@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@v7
       - run: uv sync --locked --extra dev
       - run: uv run ruff check src tests
       - run: uv run mypy
@@ -30,7 +30,7 @@ jobs:
             python: "3.12"
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@v7
       # --locked fails loudly if uv.lock has drifted from pyproject.toml, so the
       # committed lockfile is the thing CI actually installs.
       - run: uv sync --locked --extra dev --python ${{ matrix.python }}
@@ -41,7 +41,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@v7
       - run: uv build
       - run: uvx twine check dist/*
       - name: Install exactly what users receive
